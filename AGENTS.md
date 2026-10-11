@@ -33,7 +33,10 @@ the container with `--add-host=host.docker.internal:host-gateway`):
 Guarantees callers rely on — **do not break these**:
 
 - **Fail-open.** No listener reachable within ~1s → the call is a no-op and the
-  program runs on untouched. Never raise into the debugged program.
+  program runs on untouched. Never raise into the debugged program. That holds
+  after dialing too: if the deferred IPython import fails (a broken venv, say),
+  `pty_bridge._abort` prints the traceback to stderr *and* to the listener,
+  closes the socket, releases the lock, and the program runs on.
 - **One shell at a time.** A module-level lock means the first thread/process to
   reach a breakpoint gets the shell; concurrent arrivals no-op. Released when
   the session's socket/pty closes.
@@ -92,10 +95,27 @@ uv run pytest -q        # tests
 CI (`.github/workflows/ci.yml`) runs all three on push/PR for Python 3.11–3.12.
 Keep the gate green.
 
-Ruff enforces **PLC0415** (imports at the top of the file) — every import is
-at module top, no in-function imports. `import reverse_ipdb` therefore pulls in
-IPython/prompt_toolkit eagerly and requires POSIX (`termios`). It also enforces
-**TID252** (no relative imports) — use absolute `reverse_ipdb.*` imports.
+Ruff enforces **PLC0415** (imports at the top of the file). The one deliberate
+exception is in `pty_bridge.run`, marked `# noqa: PLC0415`: IPython /
+prompt_toolkit / `debugger` are imported there, **after** a listener is
+reached, not at module top. This is load-bearing — importing IPython at
+`import reverse_ipdb` time pulls in `concurrent.futures` and raises
+`can't register atexit after shutdown` when the import lands in a finalizing /
+multiprocessing interpreter, and it would also break the fail-open cheap no-op.
+Don't hoist those. (`import reverse_ipdb` still requires POSIX — `pty_bridge`
+imports `termios` at module top.) Ruff also enforces **TID252** (no relative
+imports) — use absolute `reverse_ipdb.*` imports.
+
+Those deferred imports run inside `pty_bridge._tolerate_shutdown_state()`. A
+child **forked while its parent was tearing down** inherits
+`threading._SHUTTING_DOWN = True` (`_after_fork` never resets it), after which
+the first `concurrent.futures.thread` import raises
+`can't register atexit after shutdown` — and we can't change how such a child
+was created. While importing, that context registers threading atexits exactly
+as `_register_atexit` does minus the shutdown check (the handler is still
+appended and still runs at the child's exit), then restores the original.
+`tests/test_shutdown_state.py` pins it. (Pure interpreter finalization is a
+different, unfixable case: then threads can't be created at all.)
 
 **`hasattr` is banned in the library** (prefer EAFP / try-except). Ruff has no
 native check for it, so `tests/test_style.py` enforces it by AST-scanning

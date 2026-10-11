@@ -14,19 +14,49 @@ pure-stdlib and cross-platform.
 
 import contextlib
 import fcntl
+import functools
 import os
 import struct
+import sys
 import termios
 import threading
-
-from prompt_toolkit.input.vt100 import Vt100Input
-from prompt_toolkit.output.vt100 import Vt100_Output
+import traceback
 
 from reverse_ipdb import client
-from reverse_ipdb.debugger import ReverseIPdb
 
 DEFAULT_COLS, DEFAULT_ROWS = 80, 24
 SIZE_TIMEOUT = 0.5  # how long to wait for the listener's terminal size
+
+
+@contextlib.contextmanager
+def _tolerate_shutdown_state():
+    """Let the debugger imports succeed even if ``threading`` thinks the
+    interpreter is already shutting down.
+
+    A child forked while its parent was tearing down inherits
+    ``threading._SHUTTING_DOWN = True`` (``_after_fork`` never resets it), and
+    from then on the first ``concurrent.futures.thread`` import — which IPython
+    needs — raises ``RuntimeError: can't register atexit after shutdown``. We
+    can't change how that process was created, so while importing we register
+    threading atexits exactly as ``_register_atexit`` does, minus the shutdown
+    check: the handler is still appended and still runs at this process's exit.
+    Restored immediately after the import.
+    """
+    if not getattr(threading, "_SHUTTING_DOWN", False):
+        yield
+        return
+    original = threading._register_atexit
+
+    def lenient(func, *args, **kwargs):
+        threading._threading_atexits.append(
+            functools.partial(func, *args, **kwargs)
+        )
+
+    threading._register_atexit = lenient
+    try:
+        yield
+    finally:
+        threading._register_atexit = original
 
 
 def _set_winsize(fd, cols, rows):
@@ -70,15 +100,50 @@ def _pump(src_read, dst_write, on_eof):
         on_eof()
 
 
+def _abort(sock, release, reason):
+    """Fail open after dialing: say why on stderr and on the listener, then
+    close the socket and release the shell lock so later breakpoints still work.
+    """
+    text = f"*** reverse_ipdb: {reason}\n{traceback.format_exc()}"
+    with contextlib.suppress(OSError):
+        sys.stderr.write(text)
+    with contextlib.suppress(OSError):
+        sock.sendall(text.encode("utf-8", "replace"))
+    with contextlib.suppress(OSError):
+        sock.close()
+    release()
+
+
 def run(frame, host=None, port=None):
     """Dial out and drop ``frame`` into IPython's debugger over a pty.
 
     No listener (or a shell already active elsewhere) -> no-op, program runs on.
+    A debugger that fails to import -> reported on stderr and to the listener,
+    then the program runs on as well; never raises into the debugged program.
     """
     dialed = client.dial(host, port)
     if dialed is None:
         return
     sock, release = dialed
+
+    # Imported here, not at module top, on purpose: it keeps `import
+    # reverse_ipdb` from pulling in IPython/prompt_toolkit (and, via IPython,
+    # concurrent.futures) at import time. That preserves the fail-open cheap
+    # no-op when nobody is listening, and avoids importing concurrent.futures
+    # during interpreter shutdown — which raises "can't register atexit after
+    # shutdown" in finalizing/multiprocessing contexts.
+    try:
+        with _tolerate_shutdown_state():
+            from prompt_toolkit.input.vt100 import Vt100Input  # noqa: PLC0415
+            from prompt_toolkit.output.vt100 import Vt100_Output  # noqa: PLC0415
+
+            from reverse_ipdb.debugger import ReverseIPdb  # noqa: PLC0415
+    except Exception:
+        # A broken debugger environment (e.g. mismatched IPython/pygments
+        # files) must not take the program down: report it on both ends of
+        # the wire, hand the socket and the shell lock back, and run on.
+        _abort(sock, release, "debugger import failed, continuing without a shell")
+        return
 
     try:
         sock.sendall(client.banner().encode("utf-8"))
