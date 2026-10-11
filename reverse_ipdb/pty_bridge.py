@@ -17,8 +17,10 @@ import fcntl
 import functools
 import os
 import struct
+import sys
 import termios
 import threading
+import traceback
 
 from reverse_ipdb import client
 
@@ -98,10 +100,26 @@ def _pump(src_read, dst_write, on_eof):
         on_eof()
 
 
+def _abort(sock, release, reason):
+    """Fail open after dialing: say why on stderr and on the listener, then
+    close the socket and release the shell lock so later breakpoints still work.
+    """
+    text = f"*** reverse_ipdb: {reason}\n{traceback.format_exc()}"
+    with contextlib.suppress(OSError):
+        sys.stderr.write(text)
+    with contextlib.suppress(OSError):
+        sock.sendall(text.encode("utf-8", "replace"))
+    with contextlib.suppress(OSError):
+        sock.close()
+    release()
+
+
 def run(frame, host=None, port=None):
     """Dial out and drop ``frame`` into IPython's debugger over a pty.
 
     No listener (or a shell already active elsewhere) -> no-op, program runs on.
+    A debugger that fails to import -> reported on stderr and to the listener,
+    then the program runs on as well; never raises into the debugged program.
     """
     dialed = client.dial(host, port)
     if dialed is None:
@@ -114,11 +132,18 @@ def run(frame, host=None, port=None):
     # no-op when nobody is listening, and avoids importing concurrent.futures
     # during interpreter shutdown — which raises "can't register atexit after
     # shutdown" in finalizing/multiprocessing contexts.
-    with _tolerate_shutdown_state():
-        from prompt_toolkit.input.vt100 import Vt100Input  # noqa: PLC0415
-        from prompt_toolkit.output.vt100 import Vt100_Output  # noqa: PLC0415
+    try:
+        with _tolerate_shutdown_state():
+            from prompt_toolkit.input.vt100 import Vt100Input  # noqa: PLC0415
+            from prompt_toolkit.output.vt100 import Vt100_Output  # noqa: PLC0415
 
-        from reverse_ipdb.debugger import ReverseIPdb  # noqa: PLC0415
+            from reverse_ipdb.debugger import ReverseIPdb  # noqa: PLC0415
+    except Exception:
+        # A broken debugger environment (e.g. mismatched IPython/pygments
+        # files) must not take the program down: report it on both ends of
+        # the wire, hand the socket and the shell lock back, and run on.
+        _abort(sock, release, "debugger import failed, continuing without a shell")
+        return
 
     try:
         sock.sendall(client.banner().encode("utf-8"))

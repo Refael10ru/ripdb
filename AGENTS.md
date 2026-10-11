@@ -33,7 +33,10 @@ the container with `--add-host=host.docker.internal:host-gateway`):
 Guarantees callers rely on — **do not break these**:
 
 - **Fail-open.** No listener reachable within ~1s → the call is a no-op and the
-  program runs on untouched. Never raise into the debugged program.
+  program runs on untouched. Never raise into the debugged program. That holds
+  after dialing too: if the deferred IPython import fails (a broken venv, say),
+  `pty_bridge._abort` prints the traceback to stderr *and* to the listener,
+  closes the socket, releases the lock, and the program runs on.
 - **One shell at a time.** A module-level lock means the first thread/process to
   reach a breakpoint gets the shell; concurrent arrivals no-op. Released when
   the session's socket/pty closes.
