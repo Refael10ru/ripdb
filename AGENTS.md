@@ -92,10 +92,16 @@ uv run pytest -q        # tests
 CI (`.github/workflows/ci.yml`) runs all three on push/PR for Python 3.11–3.12.
 Keep the gate green.
 
-Ruff enforces **PLC0415** (imports at the top of the file) — every import is
-at module top, no in-function imports. `import reverse_ipdb` therefore pulls in
-IPython/prompt_toolkit eagerly and requires POSIX (`termios`). It also enforces
-**TID252** (no relative imports) — use absolute `reverse_ipdb.*` imports.
+Ruff enforces **PLC0415** (imports at the top of the file). The one deliberate
+exception is in `pty_bridge.run`, marked `# noqa: PLC0415`: IPython /
+prompt_toolkit / `debugger` are imported there, **after** a listener is
+reached, not at module top. This is load-bearing — importing IPython at
+`import reverse_ipdb` time pulls in `concurrent.futures` and raises
+`can't register atexit after shutdown` when the import lands in a finalizing /
+multiprocessing interpreter, and it would also break the fail-open cheap no-op.
+Don't hoist those. (`import reverse_ipdb` still requires POSIX — `pty_bridge`
+imports `termios` at module top.) Ruff also enforces **TID252** (no relative
+imports) — use absolute `reverse_ipdb.*` imports.
 
 **`hasattr` is banned in the library** (prefer EAFP / try-except). Ruff has no
 native check for it, so `tests/test_style.py` enforces it by AST-scanning

@@ -16,3 +16,21 @@ def test_no_listener_is_noop():
     )
     assert out.returncode == 0
     assert "OK" in out.stdout
+
+
+def test_import_does_not_pull_in_ipython():
+    # `import reverse_ipdb` must stay light: importing IPython/prompt_toolkit
+    # eagerly drags in concurrent.futures, which raises "can't register atexit
+    # after shutdown" when the import lands in a finalizing interpreter.
+    src = (
+        "import reverse_ipdb, sys; "
+        "print(any(m == 'IPython' or m.startswith('IPython.') "
+        "or m == 'prompt_toolkit' or m.startswith('prompt_toolkit.') "
+        "for m in sys.modules))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", src],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False", out.stdout + out.stderr

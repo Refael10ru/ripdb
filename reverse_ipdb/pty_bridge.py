@@ -19,11 +19,7 @@ import struct
 import termios
 import threading
 
-from prompt_toolkit.input.vt100 import Vt100Input
-from prompt_toolkit.output.vt100 import Vt100_Output
-
 from reverse_ipdb import client
-from reverse_ipdb.debugger import ReverseIPdb
 
 DEFAULT_COLS, DEFAULT_ROWS = 80, 24
 SIZE_TIMEOUT = 0.5  # how long to wait for the listener's terminal size
@@ -79,6 +75,17 @@ def run(frame, host=None, port=None):
     if dialed is None:
         return
     sock, release = dialed
+
+    # Imported here, not at module top, on purpose: it keeps `import
+    # reverse_ipdb` from pulling in IPython/prompt_toolkit (and, via IPython,
+    # concurrent.futures) at import time. That preserves the fail-open cheap
+    # no-op when nobody is listening, and avoids importing concurrent.futures
+    # during interpreter shutdown — which raises "can't register atexit after
+    # shutdown" in finalizing/multiprocessing contexts.
+    from prompt_toolkit.input.vt100 import Vt100Input  # noqa: PLC0415
+    from prompt_toolkit.output.vt100 import Vt100_Output  # noqa: PLC0415
+
+    from reverse_ipdb.debugger import ReverseIPdb  # noqa: PLC0415
 
     try:
         sock.sendall(client.banner().encode("utf-8"))
