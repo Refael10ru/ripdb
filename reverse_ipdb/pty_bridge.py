@@ -14,6 +14,7 @@ pure-stdlib and cross-platform.
 
 import contextlib
 import fcntl
+import functools
 import os
 import struct
 import termios
@@ -23,6 +24,37 @@ from reverse_ipdb import client
 
 DEFAULT_COLS, DEFAULT_ROWS = 80, 24
 SIZE_TIMEOUT = 0.5  # how long to wait for the listener's terminal size
+
+
+@contextlib.contextmanager
+def _tolerate_shutdown_state():
+    """Let the debugger imports succeed even if ``threading`` thinks the
+    interpreter is already shutting down.
+
+    A child forked while its parent was tearing down inherits
+    ``threading._SHUTTING_DOWN = True`` (``_after_fork`` never resets it), and
+    from then on the first ``concurrent.futures.thread`` import — which IPython
+    needs — raises ``RuntimeError: can't register atexit after shutdown``. We
+    can't change how that process was created, so while importing we register
+    threading atexits exactly as ``_register_atexit`` does, minus the shutdown
+    check: the handler is still appended and still runs at this process's exit.
+    Restored immediately after the import.
+    """
+    if not getattr(threading, "_SHUTTING_DOWN", False):
+        yield
+        return
+    original = threading._register_atexit
+
+    def lenient(func, *args, **kwargs):
+        threading._threading_atexits.append(
+            functools.partial(func, *args, **kwargs)
+        )
+
+    threading._register_atexit = lenient
+    try:
+        yield
+    finally:
+        threading._register_atexit = original
 
 
 def _set_winsize(fd, cols, rows):
@@ -82,10 +114,11 @@ def run(frame, host=None, port=None):
     # no-op when nobody is listening, and avoids importing concurrent.futures
     # during interpreter shutdown — which raises "can't register atexit after
     # shutdown" in finalizing/multiprocessing contexts.
-    from prompt_toolkit.input.vt100 import Vt100Input  # noqa: PLC0415
-    from prompt_toolkit.output.vt100 import Vt100_Output  # noqa: PLC0415
+    with _tolerate_shutdown_state():
+        from prompt_toolkit.input.vt100 import Vt100Input  # noqa: PLC0415
+        from prompt_toolkit.output.vt100 import Vt100_Output  # noqa: PLC0415
 
-    from reverse_ipdb.debugger import ReverseIPdb  # noqa: PLC0415
+        from reverse_ipdb.debugger import ReverseIPdb  # noqa: PLC0415
 
     try:
         sock.sendall(client.banner().encode("utf-8"))

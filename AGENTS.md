@@ -103,6 +103,17 @@ Don't hoist those. (`import reverse_ipdb` still requires POSIX — `pty_bridge`
 imports `termios` at module top.) Ruff also enforces **TID252** (no relative
 imports) — use absolute `reverse_ipdb.*` imports.
 
+Those deferred imports run inside `pty_bridge._tolerate_shutdown_state()`. A
+child **forked while its parent was tearing down** inherits
+`threading._SHUTTING_DOWN = True` (`_after_fork` never resets it), after which
+the first `concurrent.futures.thread` import raises
+`can't register atexit after shutdown` — and we can't change how such a child
+was created. While importing, that context registers threading atexits exactly
+as `_register_atexit` does minus the shutdown check (the handler is still
+appended and still runs at the child's exit), then restores the original.
+`tests/test_shutdown_state.py` pins it. (Pure interpreter finalization is a
+different, unfixable case: then threads can't be created at all.)
+
 **`hasattr` is banned in the library** (prefer EAFP / try-except). Ruff has no
 native check for it, so `tests/test_style.py` enforces it by AST-scanning
 `reverse_ipdb/*.py`; add banned builtins to its `BANNED_CALLS` set.
