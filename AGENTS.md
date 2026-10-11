@@ -50,22 +50,29 @@ Guarantees callers rely on — **do not break these**:
 
 ```sh
 uv run reverse_ipdb-serve --keep          # fan-in: serve one container, detach, next…
+uv run reverse_ipdb-serve --keep --single # one at a time: the others are told to continue
 python -m reverse_ipdb.serve --keep       # same, without uv
 socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
 ```
 
 `reverse_ipdb-serve` accepts every container immediately (none refused), shows a live
 roster (`queued:` / `attached:` / `detached:`), and puts your terminal in raw
-mode so completion works. Use a **raw** listener — `nc` mangles completion
-(line-buffered + local echo).
+mode so completion works. With `--single` nothing queues: while one container
+holds the slot (queued or attached), every other arrival is answered `continue`
+(roster: `continued:`) and runs on as if no listener existed. Use a **raw**
+listener — `nc` mangles completion (line-buffered + local echo).
 
 ## Wire protocol (keep stable across both sides)
 
 1. Target connects and sends one banner line:
    `*** reverse_ipdb/pty <host> pid=<pid> thread=<name>\n`. The listener strips the
    `reverse_ipdb/pty` tag and shows the rest as the session's identity.
-2. The listener replies with one size line `"<cols> <rows>\n"`; the target sets
-   the pty winsize (defaults to 80×24 if none arrives within `SIZE_TIMEOUT`).
+2. The listener replies **at once** (from its acceptor, not when it later
+   attaches) with one line: `"<cols> <rows>\n"` — the target sets the pty
+   winsize — or `"continue\n"` — the target hangs up, releases the shell lock
+   and runs on without importing IPython. Hanging up before any reply counts
+   as `continue`. No reply within `SIZE_TIMEOUT` (a plain socat listener) →
+   default 80×24.
 3. The stream is then a raw vt100 terminal both ways until the socket closes.
 
 ## Module map
@@ -76,7 +83,7 @@ reverse_ipdb/
   client.py      dial() + shell lock + banner(); resolve_target()
   pty_bridge.py  open pty, run TerminalPdb on it, pump <-> socket, teardown
   debugger.py    ReverseIPdb (TerminalPdb) + DetachMixin
-  serve.py       fan-in listener: accept-all + roster + raw pty pass-through
+  serve.py       fan-in listener: accept-all + roster + raw pty pass-through (--single)
 ```
 
 Completion mechanism, in one line: IPython's `TerminalPdb.cmdloop` rebinds its
@@ -128,8 +135,12 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   *after* TAB, proving the completer evaluated the live object; and the target
   must exit 0 after detach (no leaked prompt_toolkit threads). If you touch
   `pty_bridge.py` or the protocol, this is the test that matters.
-- `tests/test_serve.py` — banner parsing and "many containers all queued,
-  none refused".
+- `tests/test_serve.py` — banner parsing, "many containers all queued, none
+  refused" (each answered with the size line on arrival), and `--single`
+  (one holds the slot, the rest get `continue`, slot frees on detach).
+- `tests/test_handshake.py` — the target's side of the reply line: size /
+  `continue` / hang-up / silence, and a `continue`d target resumes without
+  importing IPython and can dial again.
 - `tests/test_api.py` — default routing to the pty bridge and aliasing.
 - `tests/test_client.py` — fail-open and shell-lock acquire/release via `dial()`.
 

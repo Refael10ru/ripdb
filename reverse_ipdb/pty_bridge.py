@@ -64,23 +64,30 @@ def _set_winsize(fd, cols, rows):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def _read_size(sock):
-    """Read the listener's ``"cols rows\\n"`` size line, or fall back to a default.
+def _read_reply(sock):
+    """Read the listener's one-line reply to our banner.
 
-    reverse_ipdb-serve sends it right after attaching; a plain socat/nc listener
-    won't, so we time out and use a sensible default.
+    ``"cols rows\\n"`` -> that terminal size. ``"continue\\n"`` (or the
+    listener hanging up before replying) -> ``None``: no shell for us, run on.
+    A plain socat/nc listener never replies, so after ``SIZE_TIMEOUT`` we fall
+    back to a default size.
     """
     sock.settimeout(SIZE_TIMEOUT)
     buf = bytearray()
+    closed = False
     with contextlib.suppress(OSError):
         while not buf.endswith(b"\n") and len(buf) < 32:
             chunk = sock.recv(1)
             if not chunk:
+                closed = True
                 break
             buf += chunk
     sock.settimeout(None)
+    line = buf.strip()
+    if line == b"continue" or (closed and not line):
+        return None
     try:
-        cols, rows = (int(x) for x in buf.split())
+        cols, rows = (int(x) for x in line.split())
         return cols, rows
     except ValueError:
         return DEFAULT_COLS, DEFAULT_ROWS
@@ -100,24 +107,30 @@ def _pump(src_read, dst_write, on_eof):
         on_eof()
 
 
+def _hangup(sock, release):
+    """Give the socket and the shell lock back; later breakpoints can dial again."""
+    with contextlib.suppress(OSError):
+        sock.close()
+    release()
+
+
 def _abort(sock, release, reason):
     """Fail open after dialing: say why on stderr and on the listener, then
-    close the socket and release the shell lock so later breakpoints still work.
+    hang up so the program runs on and later breakpoints still work.
     """
     text = f"*** reverse_ipdb: {reason}\n{traceback.format_exc()}"
     with contextlib.suppress(OSError):
         sys.stderr.write(text)
     with contextlib.suppress(OSError):
         sock.sendall(text.encode("utf-8", "replace"))
-    with contextlib.suppress(OSError):
-        sock.close()
-    release()
+    _hangup(sock, release)
 
 
 def run(frame, host=None, port=None):
     """Dial out and drop ``frame`` into IPython's debugger over a pty.
 
     No listener (or a shell already active elsewhere) -> no-op, program runs on.
+    A listener that replies ``continue`` -> same no-op, nothing imported.
     A debugger that fails to import -> reported on stderr and to the listener,
     then the program runs on as well; never raises into the debugged program.
     """
@@ -125,6 +138,20 @@ def run(frame, host=None, port=None):
     if dialed is None:
         return
     sock, release = dialed
+
+    # Handshake first: banner out, one reply line back. A listener that answers
+    # "continue" (reverse_ipdb-serve --single while it's busy) gets no shell
+    # from us — hang up and run on, without ever importing the debugger.
+    try:
+        sock.sendall(client.banner().encode("utf-8"))
+    except OSError:
+        _hangup(sock, release)
+        return
+    size = _read_reply(sock)
+    if size is None:
+        _hangup(sock, release)
+        return
+    cols, rows = size
 
     # Imported here, not at module top, on purpose: it keeps `import
     # reverse_ipdb` from pulling in IPython/prompt_toolkit (and, via IPython,
@@ -145,13 +172,6 @@ def run(frame, host=None, port=None):
         _abort(sock, release, "debugger import failed, continuing without a shell")
         return
 
-    try:
-        sock.sendall(client.banner().encode("utf-8"))
-    except OSError:
-        release()
-        return
-
-    cols, rows = _read_size(sock)
     master_fd, slave_fd = os.openpty()  # api.set_trace guards non-POSIX first
     _set_winsize(slave_fd, cols, rows)
 

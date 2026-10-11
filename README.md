@@ -74,6 +74,7 @@ Configuration resolves **argument → environment variable → default**:
 ```sh
 uv run reverse_ipdb-serve               # serve the first container, then exit
 uv run reverse_ipdb-serve --keep        # fan-in: detach one, drop into the next waiting
+uv run reverse_ipdb-serve --keep --single  # one at a time; everyone else just continues
 uv run reverse_ipdb-serve --port 4444   # pick the port
 # (or: python -m reverse_ipdb.serve, once the package is installed)
 ```
@@ -104,7 +105,7 @@ none is ever refused — and each stays paused at its `set_trace` until it's
 your turn. You get a live roster and walk them one at a time:
 
 ```
-*** reverse_ipdb listening on 0.0.0.0:4444 (keep-alive) — Ctrl-C to quit
+*** reverse_ipdb listening on 0.0.0.0:4444 (fan-in, keep-alive) — Ctrl-C to quit
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** queued: worker-3a1 pid=9 thread=Thread-2    (2 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread  (1 still waiting)
@@ -115,6 +116,18 @@ your turn. You get a live roster and walk them one at a time:
 
 You never connect *to* the containers — they come to you. (This is exactly
 what forward debuggers like madbg can't do: there you'd chase N endpoints.)
+
+Don't want a queue? Add `--single`. Then only one container is yours at a
+time; every other one that hits a breakpoint meanwhile is told to **continue**
+on the spot and runs on untouched, exactly as if no listener were running:
+
+```
+*** reverse_ipdb listening on 0.0.0.0:4444 (single, keep-alive) — Ctrl-C to quit
+*** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
+*** attached: web-7f9c pid=12 thread=MainThread
+*** continued: worker-3a1 pid=9 thread=Thread-2  (busy with web-7f9c pid=12 thread=MainThread)
+   … `detach` frees the slot; the next container to arrive gets a shell …
+```
 
 The bundled `serve` identifies each container by its banner, keeps the fan-in
 roster, and — for IPython (pty) sessions — puts your terminal in raw mode so
