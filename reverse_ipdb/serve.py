@@ -17,6 +17,7 @@ and runs on as if no listener existed.
 """
 
 import argparse
+import collections
 import contextlib
 import os
 import queue
@@ -61,6 +62,24 @@ def _terminal_size():
         size = os.get_terminal_size(sys.stdin.fileno())
         return size.columns, size.lines
     return 80, 24
+
+
+def _note_continued(counts):
+    """One digest line for the containers turned away during a session.
+
+    Printed on detach, never mid-session: while attached, the terminal is in
+    raw mode and belongs to the remote shell, and a loop hitting its
+    breakpoint would otherwise spray a line per iteration over it.
+    """
+    if not counts:
+        return
+    top = counts.most_common(3)
+    who = ", ".join(f"{ident} ×{n}" if n > 1 else ident for ident, n in top)
+    more = len(counts) - len(top)
+    if more:
+        who += f", +{more} more"
+    _note(f"continued ×{sum(counts.values())} while attached: {who}")
+    counts.clear()
 
 
 def _reply(conn, line):
@@ -116,6 +135,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
     sessions = queue.Queue()
     stopping = threading.Event()
     slot = threading.Lock()   # --no-queue: held from arrival until detach
+    continued = collections.Counter()  # --no-queue: turned away while the slot was held
     cols, rows = _terminal_size()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -138,7 +158,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
                 if no_queue and not slot.acquire(blocking=False):
                     _reply(conn, "continue")
                     conn.close()
-                    _note(f"continued: {ident}")
+                    continued[ident] += 1  # reported in one line on detach
                     continue
                 _reply(conn, f"{cols} {rows}")
                 sessions.put((conn, ident))
@@ -160,6 +180,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
                 else:
                     _note(f"detached: {ident}")
                 if no_queue:
+                    _note_continued(continued)
                     slot.release()
                 if not keep:
                     return

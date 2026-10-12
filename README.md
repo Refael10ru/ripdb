@@ -125,9 +125,14 @@ on the spot and runs on untouched, exactly as if no listener were running:
 *** reverse_ipdb listening on 0.0.0.0:4444 (no queue, keep-alive) — Ctrl-C to quit
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread
-*** continued: worker-3a1 pid=9 thread=Thread-2
-   … `detach` frees the slot; the next container to arrive gets a shell …
+   … debug web-7f9c; meanwhile other breakpoints just continue, silently …
+*** detached: web-7f9c pid=12 thread=MainThread
+*** continued ×37 while attached: worker-3a1 pid=9 thread=Thread-2 ×36, worker-4b0 pid=3 thread=MainThread
 ```
+
+While you're attached the terminal belongs to that shell, so the listener
+stays quiet; the containers it turned away meanwhile are summed up in one
+line when you detach.
 
 The bundled `serve` identifies each container by its banner, keeps the fan-in
 roster, and — for IPython (pty) sessions — puts your terminal in raw mode so

@@ -59,7 +59,10 @@ socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
 roster (`queued:` / `attached:` / `detached:`), and puts your terminal in raw
 mode so completion works. With `--no-queue`, while one container
 holds the slot (queued or attached), every other arrival is answered `continue`
-(roster: `continued:`) and runs on as if no listener existed. Use a **raw**
+and runs on as if no listener existed; those are reported in **one digest
+line on detach** (`continued ×N while attached: …`), never mid-session — the
+terminal is in raw mode and belongs to the remote shell then, so a loop
+hitting its breakpoint must not spray lines over it. Use a **raw**
 listener — `nc` mangles completion (line-buffered + local echo).
 
 ## Wire protocol (keep stable across both sides)
@@ -137,7 +140,8 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   `pty_bridge.py` or the protocol, this is the test that matters.
 - `tests/test_serve.py` — banner parsing, "many containers all queued, none
   refused" (each answered with the size line on arrival), and `--no-queue`
-  (one holds the slot, the rest get `continue`, slot frees on detach).
+  (one holds the slot, the rest get `continue` silently, one digest line on
+  detach, slot frees on detach).
 - `tests/test_handshake.py` — the target's side of the reply line: size /
   `continue` / hang-up / silence, and a `continue`d target resumes without
   importing IPython and can dial again.

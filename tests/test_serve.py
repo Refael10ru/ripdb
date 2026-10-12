@@ -1,5 +1,6 @@
 """Tests for the fan-in listener: banner parsing, no-container-refused, --no-queue."""
 
+import collections
 import re
 import socket
 import threading
@@ -108,8 +109,8 @@ def test_simultaneous_containers_are_all_queued_none_refused():
 
 
 def test_no_queue_continues_everyone_while_busy():
-    """--no-queue: one container holds the slot; the rest are told to continue,
-    and the slot frees up on detach."""
+    """--no-queue: one container holds the slot; the rest are told to continue
+    (reported as one digest line on detach), and the slot frees up on detach."""
     port = _free_port()
     notes = []
     original_note, original_pump = serve_mod._note, serve_mod._pump
@@ -137,14 +138,19 @@ def test_no_queue_continues_everyone_while_busy():
         assert SIZE_LINE.match(_recv_line(first))             # gets a shell
         assert _wait(lambda: any("attached: first" in m for m in notes))
 
-        second = dial("second")
-        assert _recv_line(second) == b"continue\n"            # told to run on
-        assert second.recv(1) == b""                           # and hung up
-        assert _wait(lambda: any("continued: second" in m for m in notes)), notes
-        assert not any("queued: second" in m for m in notes)
+        for _ in range(3):                                     # a loop hitting its breakpoint
+            second = dial("second")
+            assert _recv_line(second) == b"continue\n"        # told to run on
+            assert second.recv(1) == b""                       # and hung up
+        assert not any("continued" in m or "queued: second" in m for m in notes), notes
 
         first.close()                                          # detach
         assert _wait(lambda: any("detached: first" in m for m in notes))
+        # The turned-away arrivals are reported once, after the session, not
+        # sprayed over the raw-mode shell while it was attached.
+        assert _wait(lambda: any(
+            m == "continued ×3 while attached: second pid=1 thread=MainThread ×3"
+            for m in notes)), notes
 
         third = dial("third")
         assert SIZE_LINE.match(_recv_line(third))             # slot is free again
@@ -163,3 +169,14 @@ def test_no_queue_flag_is_wired(monkeypatch):
                             keep=keep, no_queue=no_queue))
     serve_mod.main(["--no-queue", "--keep"])
     assert captured == {"keep": True, "no_queue": True}
+
+
+def test_continued_digest_groups_by_container(capsys):
+    counts = collections.Counter()
+    serve_mod._note_continued(counts)                 # nothing to say
+    assert capsys.readouterr().err == ""
+
+    counts.update(["a"] * 5 + ["b"] * 2 + ["c", "d", "e"])
+    serve_mod._note_continued(counts)
+    assert capsys.readouterr().err == "*** continued ×10 while attached: a ×5, b ×2, c, +2 more\n"
+    assert not counts                                 # drained
