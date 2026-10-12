@@ -3,7 +3,7 @@
 import inspect
 
 import reverse_ipdb
-from reverse_ipdb import api, pty_bridge
+from reverse_ipdb import api, client
 from reverse_ipdb.debugger import DetachMixin, ReverseIPdb
 
 
@@ -23,10 +23,10 @@ def test_pdb_variant_is_gone():
     assert not hasattr(reverse_ipdb, "set_trace_pdb")
 
 
-def test_set_trace_routes_to_pty_bridge(monkeypatch):
+def test_set_trace_hands_off_to_the_session_layer(monkeypatch):
     captured = {}
     monkeypatch.setattr(
-        pty_bridge, "run",
+        client, "attach",
         lambda frame, host=None, port=None: captured.update(
             frame=frame, host=host, port=port),
     )
@@ -39,7 +39,7 @@ def test_set_trace_routes_to_pty_bridge(monkeypatch):
 def test_docker_set_trace_defaults_to_docker_host(monkeypatch):
     monkeypatch.delenv("DEBUG_HOST", raising=False)
     captured = {}
-    monkeypatch.setattr(pty_bridge, "run",
+    monkeypatch.setattr(client, "attach",
                         lambda frame, host=None, port=None: captured.update(host=host))
     reverse_ipdb.docker_set_trace()
     assert captured["host"] == "host.docker.internal"
@@ -47,7 +47,7 @@ def test_docker_set_trace_defaults_to_docker_host(monkeypatch):
 
 def test_docker_set_trace_respects_arg_then_env(monkeypatch):
     captured = {}
-    monkeypatch.setattr(pty_bridge, "run",
+    monkeypatch.setattr(client, "attach",
                         lambda frame, host=None, port=None: captured.update(host=host))
 
     monkeypatch.setenv("DEBUG_HOST", "10.0.0.5")

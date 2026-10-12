@@ -44,23 +44,28 @@ The only surface callers touch.
   `host.docker.internal` (arg → `DEBUG_HOST` → that)
 
 **Responsibility:** be the entry point and nothing more. It grabs the caller's
-frame, guards non-POSIX (no `os.openpty` → no-op), and hands off to Layer 3
-(`pty_bridge.run`). It holds no sockets, no configuration logic, and no
-debugger behaviour of its own — so the public contract stays stable even if the
-layers beneath change.
+frame and hands off to Layer 2 (`client.attach`). It holds no sockets, no
+configuration logic, and no debugger behaviour of its own — so the public
+contract stays stable even if the layers beneath change.
 
 ## Layer 2 — Session / connection (`client.py`)
 
 Decides **whether a debugging session should happen at all**, before any
 debugger exists.
 
+- `attach(frame, host, port)` — the layer's entry: `dial`, then `handshake`,
+  and only if the listener wants us, hand the live socket **down** to Layer 3
+  (`pty_bridge.run`). Every "no" on the way is a silent no-op.
 - `resolve_target()` — host/port precedence: **argument → env var → default**.
 - `dial()` — acquires the shell lock, then dials the listener with a short
   timeout and **fails open** (returns `None`, releasing the lock) when nobody
-  is listening. Returns `(sock, release)` otherwise. It also returns `None`
-  without connecting while this thread is cooling down (below).
-- `banner()` — the identity line sent first: a JSON object (`protocol.py`)
-  tagged `"reverse_ipdb": "pty"` with `host` / `pid` / `thread`.
+  is listening. Returns `(sock, release)` otherwise; `release` closes the
+  socket and frees the lock. It also returns `None` without connecting while
+  this thread is cooling down (below).
+- `banner()` / `handshake()` — send the identity line (a JSON object tagged
+  `"reverse_ipdb": "pty"` with `host` / `pid` / `thread`) and read the reply:
+  a terminal size → proceed; `continue` (with an optional cooldown) or the
+  listener hanging up → no session, before any debugger is imported.
 - `cool_down(seconds)` — called when the listener answered `continue` with a
   cooldown: this thread won't dial again for that long. The state is a
   **thread-local**, so no lock is involved and other threads are unaffected;
@@ -79,14 +84,12 @@ its own.
 
 The interactive behaviour, and the byte pipe that carries it.
 
-- **Handshake first, debugger second.** `pty_bridge.run` sends the banner and
-  reads the listener's one-line reply (`protocol.py`) *before* importing
-  IPython. A size → open the pty at that size. `continue` (or the listener
-  hanging up) → hang up, release the lock, apply any cooldown, run on — the
-  debugger is never imported. Only then are IPython / prompt_toolkit / the
-  debugger imported, deferred so `import reverse_ipdb` stays light; if that
-  import fails (a broken venv), `_abort` writes the traceback to stderr *and*
-  to the listener, hangs up, and the program runs on.
+- `pty_bridge.run(frame, sock, release, cols, rows)` takes a **live socket**
+  from Layer 2 — it never dials or handshakes itself. Its first act is the
+  deferred import of IPython / prompt_toolkit / the debugger (deferred so
+  `import reverse_ipdb` stays light and so a `continue`d breakpoint never pays
+  for it); if that import fails (a broken venv), `_abort` writes the traceback
+  to stderr *and* to the listener, hangs up, and the program runs on.
 - `ReverseIPdb` (over IPython's `TerminalPdb`). `pty_bridge.run` launches it on
   a **pseudo-terminal** so `prompt_toolkit` engages and computes
   **tab/dot-completion** against the live frame. It passes `nosigint=True` /
@@ -158,3 +161,5 @@ tested in isolation:
 
 Dependencies only ever point downward (1→2→3), and the listener sits off to
 the side, connected solely by the socket and the shared wire format.
+`tests/test_layers.py` scans every intra-package import (deferred ones
+included) and fails the gate on any upward or skipped edge.

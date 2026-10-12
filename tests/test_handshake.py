@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from reverse_ipdb import client, protocol, pty_bridge
+from reverse_ipdb import client, protocol
 
 
 def _pair():
@@ -35,7 +35,7 @@ def _reply(a, **fields):
 def test_reply_size():
     a, b = _pair()
     _reply(a, cols=132, rows=43)
-    assert pty_bridge._handshake(b) == (132, 43)
+    assert client.handshake(b) == (132, 43)
     a.close()
     b.close()
 
@@ -43,12 +43,12 @@ def test_reply_size():
 def test_reply_tolerates_missing_and_unknown_keys():
     a, b = _pair()
     _reply(a, cols=100, future="ignored")              # no rows -> default rows
-    assert pty_bridge._handshake(b) == (100, pty_bridge.DEFAULT_ROWS)
+    assert client.handshake(b) == (100, client.DEFAULT_ROWS)
     a.close()
     b.close()
     a, b = _pair()
     a.sendall(b"80 24\n")                              # not a JSON object -> defaults
-    assert pty_bridge._handshake(b) == (pty_bridge.DEFAULT_COLS, pty_bridge.DEFAULT_ROWS)
+    assert client.handshake(b) == (client.DEFAULT_COLS, client.DEFAULT_ROWS)
     a.close()
     b.close()
 
@@ -56,7 +56,7 @@ def test_reply_tolerates_missing_and_unknown_keys():
 def test_reply_continue_means_no_shell_and_no_cooldown_unless_given():
     a, b = _pair()
     _reply(a, **{"continue": True})
-    assert pty_bridge._handshake(b) is None
+    assert client.handshake(b) is None
     assert client._local.skip_until == 0.0
     a.close()
     b.close()
@@ -66,7 +66,7 @@ def test_reply_continue_with_cooldown_cools_this_thread_down():
     a, b = _pair()
     _reply(a, **{"continue": True, "cooldown": 2.5})
     before = time.monotonic()
-    assert pty_bridge._handshake(b) is None
+    assert client.handshake(b) is None
     assert before + 2.4 < client._local.skip_until <= time.monotonic() + 2.5
     a.close()
     b.close()
@@ -75,15 +75,15 @@ def test_reply_continue_with_cooldown_cools_this_thread_down():
 def test_reply_hangup_means_no_shell():
     a, b = _pair()
     a.close()
-    assert pty_bridge._handshake(b) is None
+    assert client.handshake(b) is None
     b.close()
 
 
 def test_reply_silence_falls_back_to_default_size(monkeypatch):
     # A plain socat/nc listener never replies: default size after the timeout.
-    monkeypatch.setattr(pty_bridge, "SIZE_TIMEOUT", 0.05)
+    monkeypatch.setattr(client, "REPLY_TIMEOUT", 0.05)
     a, b = _pair()
-    assert pty_bridge._handshake(b) == (pty_bridge.DEFAULT_COLS, pty_bridge.DEFAULT_ROWS)
+    assert client.handshake(b) == (client.DEFAULT_COLS, client.DEFAULT_ROWS)
     a.close()
     b.close()
 

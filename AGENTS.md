@@ -90,21 +90,27 @@ the other — add keys, never repurpose or remove them.
      up, releases the shell lock and runs on without importing IPython, and
      that thread doesn't dial again for `cooldown` seconds (0 if absent).
    The listener hanging up counts as `continue`. No reply within
-   `SIZE_TIMEOUT` (a plain socat listener) → default size; a line that isn't a
-   JSON object → same.
+   `client.REPLY_TIMEOUT` (a plain socat listener) → default size; a line that
+   isn't a JSON object → same.
 3. The stream is then a raw vt100 terminal both ways until the socket closes.
 
 ## Module map
 
 ```
 reverse_ipdb/
-  api.py         entry points (set_trace / set_trace_ipython); POSIX guard
-  client.py      dial() + shell lock + banner() + continue cooldown; resolve_target()
-  protocol.py    the JSON-object-per-line handshake: encode / decode / read_line
-  pty_bridge.py  open pty, run TerminalPdb on it, pump <-> socket, teardown
-  debugger.py    ReverseIPdb (TerminalPdb) + DetachMixin
-  serve.py       fan-in listener: accept-all + roster + raw pty pass-through (--no-queue)
+  api.py         layer 1: entry points (set_trace / set_trace_ipython) -> client.attach
+  client.py      layer 2: attach() = dial() + handshake(); shell lock; cooldown -> pty_bridge.run
+  pty_bridge.py  layer 3: run(frame, sock, release, cols, rows): deferred debugger import,
+                 pty, pumps <-> socket, teardown
+  debugger.py    layer 3: ReverseIPdb (TerminalPdb) + DetachMixin
+  protocol.py    the wire, shared by both ends: JSON-object-per-line encode / decode / read_line
+  serve.py       the peer: fan-in listener, accept-all + roster + raw pass-through (--no-queue)
 ```
+
+Dependencies point **down only** (api → client → pty_bridge → debugger; serve
+and client share just `protocol`). `tests/test_layers.py` AST-scans every
+intra-package import, deferred ones included, and fails on any other edge —
+extend its `ALLOWED` table when adding a module, never by widening a layer.
 
 Completion mechanism, in one line: IPython's `TerminalPdb.cmdloop` rebinds its
 `IPCompleter` to the live frame before each prompt, and we run that prompt on a
@@ -164,7 +170,8 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
 - `tests/test_handshake.py` — the target's side of the reply line: size /
   `continue` / hang-up / silence, and a `continue`d target resumes without
   importing IPython and can dial again.
-- `tests/test_api.py` — default routing to the pty bridge and aliasing.
+- `tests/test_api.py` — hand-off to `client.attach` and aliasing.
+- `tests/test_layers.py` — the import graph matches `docs/api-layers.md`.
 - `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,
   and the per-thread `continue` cooldown.
 
