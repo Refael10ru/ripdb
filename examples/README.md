@@ -8,8 +8,9 @@ use `reverse_ipdb-serve` as the listener (it puts your terminal in raw mode so
 completion and special keys work). Start it first, in a separate terminal:
 
 ```sh
-uv run reverse_ipdb-serve          # one session
-uv run reverse_ipdb-serve --keep   # keep listening across detaches / fan-in
+uv run reverse_ipdb-serve                 # one session
+uv run reverse_ipdb-serve --keep          # keep listening across detaches / fan-in
+uv run reverse_ipdb-serve --keep --no-queue # don't queue: the rest continue
 ```
 
 Then, in another terminal, run an example. If no listener is running, the

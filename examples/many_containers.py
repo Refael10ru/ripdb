@@ -13,7 +13,8 @@ with tab-completion — inspect `worker_id` and `payload` (try `payload[<TAB>`
 or `pay<TAB>`), then type `detach` to advance to the next waiting worker.
 
 With no listener running, every worker's breakpoint is a no-op and they all
-just finish.
+just finish. Run the listener with ``--no-queue`` instead and only one worker at
+a time gets a shell: the others are told to continue and finish right away.
 """
 
 import multiprocessing

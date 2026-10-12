@@ -91,10 +91,12 @@ The interactive behaviour, and the byte pipe that carries it.
 Not part of the target-side stack; it runs on **your** machine as the other
 end of the socket (`python -m reverse_ipdb.serve`, or a plain `socat`/`nc`). A
 background acceptor thread fans in **every** connecting container at once —
-reading each one's banner and queueing it so none is refused — while the
-foreground serves them one at a time with a live roster (`--keep` to advance
-into the next instead of exiting). Each session is a raw-mode pass-through:
-it sends the terminal size, then forwards bytes both ways via select (so
+reading each one's banner, answering it with the terminal size and queueing
+it so none is refused — while the foreground serves them one at a time with a
+live roster (`--keep` to advance into the next instead of exiting). With
+`--no-queue` the acceptor answers `continue` instead whenever another container
+already holds the slot, and that container runs on untouched. Each session is
+a raw-mode pass-through: it forwards bytes both ways via select (so
 completion and special keys work) and returns the instant the socket closes.
 One bad session is caught and never brings the listener down. It is documented
 alongside the layers because it speaks the same wire protocol, but it depends
