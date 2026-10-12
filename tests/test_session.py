@@ -4,14 +4,12 @@
   while the program keeps running — otherwise a fan-in listener stays on the
   finished session and the next queued container never comes up.
 - ``c`` with no breakpoints detaches (nothing could bring the prompt back).
-- Ctrl-C from the listener interrupts the target.
 
-The target's pty is not its controlling terminal, so a forwarded ``\\x03``
-byte generates no SIGINT by itself; ``ReverseIPdb.interrupt`` has to do the
-work. These tests drive a target subprocess over a raw socket, exactly as
+These tests drive a target subprocess over a raw socket, exactly as
 ``reverse_ipdb-serve`` does.
 """
 
+import contextlib
 import os
 import socket
 import subprocess
@@ -26,12 +24,6 @@ TARGET = textwrap.dedent(
     """
     import threading, time
     import reverse_ipdb
-
-    def busy(seconds):          # pure-Python loop: no blocking call to break out of
-        end = time.time() + seconds
-        while time.time() < end:
-            pass
-        return "busy done"
 
     def main():
         reverse_ipdb.set_trace(host="127.0.0.1", port={port})
@@ -152,91 +144,6 @@ def test_detach_hangs_up_while_the_program_keeps_running(target):
         srv.close()
 
 
-def test_ctrl_c_interrupts_a_blocking_command(target):
-    """``!time.sleep(30)`` then Ctrl-C: the prompt is back long before 30s."""
-    srv = _listener()
-    proc = target(srv.getsockname()[1])
-    try:
-        conn = _attach(srv)
-        conn.sendall(b"!time.sleep(30)\r")
-        time.sleep(0.5)
-        start = time.time()
-        conn.sendall(b"\x03")
-        _expect(conn, "KeyboardInterrupt", "ipdb>")
-        assert time.time() - start < 10
-        conn.sendall(b"detach\r")
-        stdout, rc = _finish(proc, srv)
-        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
-    finally:
-        srv.close()
-
-
-def test_ctrl_c_interrupts_a_command_in_a_non_main_thread(target):
-    """Off the main thread no SIGINT can help; the interrupt is delivered as an
-    async exception, which lands at the loop's next bytecode."""
-    srv = _listener()
-    proc = target(srv.getsockname()[1],
-                  run="t = threading.Thread(target=main); t.start(); t.join()")
-    try:
-        conn = _attach(srv)
-        conn.sendall(b"!busy(30)\r")
-        time.sleep(0.5)
-        conn.sendall(b"\x03")
-        text = _expect(conn, "KeyboardInterrupt", "ipdb>")
-        time.sleep(1.5)                      # past the "pending" note's delay
-        conn.sendall(b"\r")
-        text += _expect(conn, "ipdb>")
-        assert "pending" not in text         # it landed: no note about a blocked call
-        conn.sendall(b"detach\r")
-        stdout, rc = _finish(proc, srv)
-        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
-    finally:
-        srv.close()
-
-
-def test_ctrl_c_in_a_blocking_call_off_the_main_thread_says_it_is_pending(target):
-    """An async exception can't break a blocking C call; the user is told the
-    interrupt is pending, and it lands when the call returns."""
-    srv = _listener()
-    proc = target(srv.getsockname()[1],
-                  run="t = threading.Thread(target=main); t.start(); t.join()")
-    try:
-        conn = _attach(srv)
-        conn.sendall(b"!time.sleep(4)\r")
-        time.sleep(0.5)
-        conn.sendall(b"\x03")
-        _expect(conn, "KeyboardInterrupt pending", "KeyboardInterrupt--", "ipdb>")
-        conn.sendall(b"detach\r")
-        stdout, rc = _finish(proc, srv)
-        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
-    finally:
-        srv.close()
-
-
-def test_ctrl_c_while_running_stops_and_escalates(target):
-    """``n`` over ``time.sleep(30)``: the first Ctrl-C announces a stop at the
-    next line (pdb's own Ctrl-C semantics); sleep never reaches one, so the
-    second Ctrl-C raises KeyboardInterrupt into it and the prompt is back."""
-    srv = _listener()
-    proc = target(srv.getsockname()[1], between="time.sleep(30)")
-    try:
-        conn = _attach(srv)
-        conn.sendall(b"n\r")                 # over print("RESUMED")
-        _expect(conn, "RESUMED", "ipdb>")
-        conn.sendall(b"n\r")                 # over time.sleep(30): the program runs
-        time.sleep(0.5)
-        start = time.time()
-        conn.sendall(b"\x03")
-        _expect(conn, "Program interrupted")
-        conn.sendall(b"\x03")
-        _expect(conn, "KeyboardInterrupt", "ipdb>")
-        assert time.time() - start < 10
-        conn.sendall(b"detach\r")
-        _finish(proc, srv)   # the interrupted sleep propagates: exit code is the program's
-    finally:
-        srv.close()
-
-
 def test_continue_without_breakpoints_detaches_and_can_dial_again(target):
     """``c`` with nothing armed closes the socket (so a fan-in listener moves
     on) and releases the shell lock: the next set_trace dials again."""
@@ -268,11 +175,77 @@ def test_continue_with_breakpoints_keeps_the_session(target):
     proc = target(srv.getsockname()[1])
     try:
         conn = _attach(srv)
-        conn.sendall(b"b 16\r")              # the print("RESUMED AGAIN") line
+        line = next(n for n, text in enumerate(TARGET.splitlines(), 1)
+                    if "RESUMED AGAIN" in text)
+        conn.sendall(f"b {line}\r".encode())  # the print("RESUMED AGAIN") line
         _expect(conn, "Breakpoint 1", "ipdb>")
         conn.sendall(b"c\r")
-        _expect(conn, "16", "RESUMED AGAIN", "ipdb>")   # stopped there: source + prompt
+        _expect(conn, str(line), "RESUMED AGAIN", "ipdb>")   # stopped there: source + prompt
         conn.sendall(b"detach\r")
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
+    finally:
+        srv.close()
+
+
+def test_listener_hang_up_at_the_prompt_releases_the_target(target):
+    """The listener drops or quits while the target sits at its prompt: the
+    target thread must not stay paused — it detaches and runs on at once."""
+    srv = _listener()
+    proc = target(srv.getsockname()[1])
+    try:
+        conn = _attach(srv)
+        start = time.time()
+        conn.shutdown(socket.SHUT_RDWR)
+        conn.close()
+        conn2 = _attach(srv)                 # it ran on to its second set_trace
+        assert time.time() - start < 5
+        conn2.shutdown(socket.SHUT_RDWR)
+        conn2.close()
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
+    finally:
+        srv.close()
+
+
+def test_listener_hang_up_mid_command_releases_after_it(target):
+    """Dropped while a command runs: the command finishes — its output going
+    nowhere, neither blocking nor failing — then the target detaches instead
+    of prompting a listener that's gone. Nothing raised into the program."""
+    srv = _listener()
+    proc = target(srv.getsockname()[1])
+    try:
+        conn = _attach(srv)
+        conn.sendall(b"!time.sleep(1); print('x' * 200000)\r")   # output after the drop
+        time.sleep(0.3)
+        conn.shutdown(socket.SHUT_RDWR)
+        conn.close()
+        _attach(srv).close()                 # reached the second set_trace
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
+        assert "Traceback" not in stdout, stdout
+    finally:
+        srv.close()
+
+
+def test_listener_hang_up_while_running_detaches_at_next_stop(target):
+    """Dropped after ``c`` with a breakpoint armed: reaching the breakpoint
+    must not pause the program for a listener that's gone."""
+    srv = _listener()
+    proc = target(srv.getsockname()[1], between="time.sleep(0.5)")
+    try:
+        conn = _attach(srv)
+        line = next(n for n, text in enumerate(TARGET.splitlines(), 1)
+                    if "RESUMED AGAIN" in text)
+        conn.sendall(f"b {line}\r".encode())
+        _expect(conn, "Breakpoint 1", "ipdb>")
+        conn.sendall(b"c\r")
+        time.sleep(0.2)
+        conn.shutdown(socket.SHUT_RDWR)
+        conn.close()
+        srv.settimeout(1.5)                  # the second set_trace dials: answer silently
+        with contextlib.suppress(TimeoutError):
+            srv.accept()[0].close()
         stdout, rc = _finish(proc, srv)
         assert "RESUMED AGAIN" in stdout and rc == 0, stdout
     finally:

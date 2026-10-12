@@ -75,17 +75,16 @@ The interactive behaviour, and the byte pipe that carries it.
   `readrc=False` so the debugger neither hijacks the program's Ctrl-C handler
   nor reads a stray `~/.pdbrc` from the container.
 - The **pty is the transport**: two pump threads shuttle bytes between the pty
-  master and the socket. Either EOF tears the bridge down — a teardown hook
-  closes the pty, shuts down the prompt thread, **shuts down** and closes the
-  socket, and releases the shell lock. The `shutdown` matters: a bare
-  `close()` while the other pump is blocked in `recv` sends no FIN, and the
-  listener would never see the detach. A dead connection never raises into
-  the program.
-- `ReverseIPdb.interrupt()` — the socket->pty pump calls it for a Ctrl-C byte
-  whenever the prompt isn't up (no SIGINT exists for a pty that isn't the
-  controlling terminal): `KeyboardInterrupt` for a running command, a stop
-  at the next line for running code, `KeyboardInterrupt` on a second press.
-
+  master and the socket. Either side ending tears the bridge down. A detach
+  closes the pty slave (the output pump drains the parting message, then
+  closes the master), **shuts down** and closes the socket, and releases the
+  shell lock. The `shutdown` matters: a bare `close()` while the other pump is
+  blocked in `recv` sends no FIN, and the listener would never see the detach.
+- A **listener hang-up** calls `ReverseIPdb.hang_up()`, which ends the prompt
+  (now, or the next one to start) as if Ctrl-D were pressed, so the target
+  detaches and runs on instead of staying paused. Until it does, the output
+  pump discards whatever the debugger writes, so a dead connection never
+  blocks or raises into the program.
 - `DetachMixin` — redefines `q` / `quit` / `exit` / EOF (and `c` when no
   breakpoint is set) to **detach and
   continue** (via that teardown hook) instead of raising `BdbQuit` into the
@@ -99,16 +98,19 @@ The interactive behaviour, and the byte pipe that carries it.
 
 Not part of the target-side stack; it runs on **your** machine as the other
 end of the socket (`python -m reverse_ipdb.serve`, or a plain `socat`/`nc`). A
-background acceptor thread fans in **every** connecting container at once —
-reading each one's banner, answering it with the terminal size and queueing
-it so none is refused — while the foreground serves them one at a time with a
-live roster (`--keep` to advance into the next instead of exiting). With
-`--no-queue` the acceptor answers `continue` instead whenever another container
-already holds the slot, and that container runs on untouched. Each session is
-a raw-mode pass-through: it forwards bytes both ways via select (so
-completion and special keys work, Ctrl-C included) and returns the instant
-the socket closes — or when you press Ctrl-], the one local key, which drops
-the session so the next one in the queue comes up.
+background acceptor fans in **every** connecting container at once, handing
+each to a short-lived handshake thread that reads its banner (with a timeout,
+so a silent client holds up nobody), answers it with the terminal size and
+queues it so none is refused — while the foreground serves them one at a time
+with a live roster (`--keep` to advance into the next instead of exiting).
+With `--no-queue` the handshake answers `continue` instead whenever another
+container already holds the slot, and that container runs on untouched. Each
+session is a raw-mode pass-through: it forwards bytes both ways via select (so
+completion and special keys work) and returns the instant the socket closes.
+Ctrl-C stays a signal for the listener: it drops the session, and a second
+one right after quits. Ctrl-] also drops it, and a target that stops reading
+input is dropped after a timeout. Every container held is released (hung up,
+so it runs on) when its session ends and when the listener exits.
 One bad session is caught and never brings the listener down. It is documented
 alongside the layers because it speaks the same wire protocol, but it depends
 on none of the layers above and ships no shared code with them.

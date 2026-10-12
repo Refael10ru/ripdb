@@ -15,11 +15,11 @@ next one waiting. With ``--no-queue`` nobody waits: while one container is
 attached, every other one that dials in is told to ``continue`` on the spot
 and runs on as if no listener existed.
 
-While attached, every key goes to the target — Ctrl-C included, which the
-target turns into an interrupt of whatever it is running. Ctrl-] is the one
-local key: it drops the attached session on the spot (the target detaches
-and runs on) so the next one in the queue comes up, even if the current
-target is stuck or gone.
+Ctrl-C always belongs to the listener, never to the target. While attached,
+it drops the session (the target detaches and runs on) and the next one in
+the queue comes up; a second Ctrl-C right after, or one at the idle roster,
+quits — releasing every container still waiting. Ctrl-] drops the session
+too, without the quit. Every other key goes to the target.
 """
 
 import argparse
@@ -27,10 +27,12 @@ import contextlib
 import os
 import queue
 import select
+import signal
 import socket
 import sys
 import termios
 import threading
+import time
 import tty
 
 
@@ -65,7 +67,8 @@ def _read_banner(conn):
 def _terminal_size():
     with contextlib.suppress(OSError, ValueError):
         size = os.get_terminal_size(sys.stdin.fileno())
-        return size.columns, size.lines
+        if size.columns and size.lines:  # a fresh pty can report 0x0
+            return size.columns, size.lines
     return 80, 24
 
 
@@ -91,64 +94,167 @@ def _reply(conn, line):
         conn.sendall(f"{line}\n".encode())
 
 
-DROP_KEY = b"\x1d"  # Ctrl-], telnet's escape: drop the attached session locally
+def _hangup(conn):
+    """Release a container: it reads EOF and runs on.
+
+    ``shutdown`` before ``close`` so the FIN goes out even if another thread
+    still holds the socket (a bare ``close`` then sends nothing on Linux, and
+    the container would stay paused at its breakpoint).
+    """
+    with contextlib.suppress(OSError):
+        conn.shutdown(socket.SHUT_RDWR)
+    with contextlib.suppress(OSError):
+        conn.close()
+
+
+BANNER_TIMEOUT = 5.0  # a container sends its banner at once; silence means it isn't one
+SEND_TIMEOUT = 5.0    # a target that doesn't take our keystrokes this long is dropped
+QUIT_WINDOW = 1.0     # a second Ctrl-C this soon after a drop quits the listener
+DROP_KEY = b"\x1d"    # Ctrl-], telnet's escape: drop the attached session
+
+
+def _disabled_char(fd):
+    """The value that switches a terminal control character off."""
+    try:
+        value = os.fpathconf(fd, "PC_VDISABLE")
+    except (OSError, ValueError):
+        value = 0
+    return bytes([value & 0xFF])
+
+
+def _raw_with_signals(fd):
+    r"""Raw mode for the pass-through, except that Ctrl-C stays a signal.
+
+    Every key goes to the target unchanged (TAB, arrows, Ctrl-U, Ctrl-\, ...)
+    but Ctrl-C raises ``KeyboardInterrupt`` in the listener, which also breaks
+    it out of any blocking call: the listener can never be wedged. Ctrl-\ and
+    Ctrl-Z are switched off as signals, so they can't kill or suspend it.
+    """
+    tty.setraw(fd)
+    attrs = termios.tcgetattr(fd)
+    attrs[3] |= termios.ISIG
+    off = _disabled_char(fd)
+    for name in ("VQUIT", "VSUSP", "VDSUSP"):
+        try:
+            attrs[6][getattr(termios, name)] = off
+        except AttributeError:
+            continue  # VDSUSP is BSD/macOS only
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
+def _restore_terminal(fd, saved):
+    """Put the terminal back, with SIGINT held off so a Ctrl-C landing right
+    now can't leave it in raw mode."""
+    if saved is None:
+        return
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        with contextlib.suppress(OSError, termios.error):
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 def _pump(conn):
     """Raw pass-through bridge: a transparent terminal between you and the target.
 
-    Puts the local tty in raw mode and shuttles bytes both ways via select —
-    so keystrokes (TAB included, Ctrl-C included) reach the target's
-    prompt_toolkit and its vt100 rendering comes straight back. Returns the
-    instant the socket closes (clean detach, no extra keypress), or ``True``
-    when you pressed Ctrl-] to drop the session yourself — the one key that
-    never reaches the target. Whatever was typed before the attach (into the
-    roster, not the session) is discarded. The terminal size was already
-    sent by the acceptor when the container was queued.
+    Shuttles bytes both ways via select — keystrokes (TAB included) reach the
+    target's prompt_toolkit and its vt100 rendering comes straight back.
+    Returns how the session ended:
+
+    - ``"detached"`` — the target hung up (you detached), the instant it does;
+    - ``"dropped"``  — you pressed Ctrl-], the one key never sent on;
+    - ``"stalled"``  — the target stopped taking input for ``SEND_TIMEOUT``.
+
+    Ctrl-C is not passed on: it raises ``KeyboardInterrupt`` here, and the
+    caller drops the session. Whatever was typed before the attach (into the
+    roster, not the session) is discarded. The terminal size was already sent
+    when the container was queued.
     """
     fd = sys.stdin.fileno()
     saved = None
     with contextlib.suppress(OSError, termios.error):
         saved = termios.tcgetattr(fd)
-        tty.setraw(fd)
+        _raw_with_signals(fd)
         termios.tcflush(fd, termios.TCIFLUSH)
+    conn.settimeout(SEND_TIMEOUT)  # bounds sendall; recv only runs once readable
     try:
         while True:
             readable, _, _ = select.select([fd, conn], [], [])
             if conn in readable:
-                data = conn.recv(65536)
+                try:
+                    data = conn.recv(65536)
+                except OSError:
+                    return "detached"  # reset by the target
                 if not data:
-                    return False  # remote detached/closed
+                    return "detached"
                 os.write(sys.stdout.fileno(), data)
             if fd in readable:
                 data = os.read(fd, 65536)
                 if not data:
-                    return False
-                data, dropped, _ = data.partition(DROP_KEY)
-                with contextlib.suppress(OSError):
+                    return "dropped"  # our own stdin closed: nobody to drive it
+                data, drop, _ = data.partition(DROP_KEY)
+                try:
                     conn.sendall(data)
-                if dropped:
-                    return True
+                except TimeoutError:
+                    return "stalled"
+                except OSError:
+                    return "detached"
+                if drop:
+                    return "dropped"
     finally:
-        if saved is not None:
-            with contextlib.suppress(OSError, termios.error):
-                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        _restore_terminal(fd, saved)
 
 
 def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
     """Fan in reverse-pdb sessions: accept all, serve one at a time.
 
-    A background thread accepts every incoming container, reads its banner and
-    answers it at once. By default the answer is our terminal size and the
-    container is queued (so nothing is refused and each stays paused); the
-    foreground pops them in arrival order and drives one at a time. With
-    ``no_queue``, only one container holds the slot — attached or queued — and
-    every other one is answered ``continue`` and runs on immediately.
+    A background acceptor takes every incoming container and hands it to a
+    short-lived handshake thread, which reads the banner (bounded by
+    ``BANNER_TIMEOUT``, so a silent client holds up nobody) and answers at
+    once. By default the answer is our terminal size and the container is
+    queued (so nothing is refused and each stays paused); the foreground
+    drives them one at a time in arrival order. With ``no_queue``, only one
+    container holds the slot — attached or queued — and every other one is
+    answered ``continue`` and runs on immediately.
+
+    Every container we hold is released — hung up, so it runs on — when its
+    session ends, when it is dropped, and when the listener exits for any
+    reason. Ctrl-C while attached drops the session; a second one within
+    ``QUIT_WINDOW`` (or any Ctrl-C at the idle roster) quits.
     """
     sessions = queue.Queue()
     stopping = threading.Event()
     slot = threading.Lock()   # --no-queue: held from arrival until detach
+    held = set()              # every container we haven't released yet
+    held_lock = threading.Lock()
     cols, rows = _terminal_size()
+
+    def release(conn):
+        with held_lock:
+            held.discard(conn)
+        _hangup(conn)
+
+    def handshake(conn, addr):
+        try:
+            conn.settimeout(BANNER_TIMEOUT)
+            ident = _read_banner(conn)
+            if not ident or stopping.is_set():
+                if not stopping.is_set():
+                    _note(f"ignored: {addr[0]}:{addr[1]} (no banner)")
+                release(conn)
+                return
+            conn.settimeout(None)
+            if no_queue and not slot.acquire(blocking=False):
+                _reply(conn, "continue")
+                release(conn)
+                _note(f"continued: {ident}")
+                return
+            _reply(conn, f"{cols} {rows}")
+            sessions.put((conn, ident))
+            _note(f"queued: {ident}  ({sessions.qsize()} waiting)")
+        except Exception:  # never let one connection take a container down with it
+            release(conn)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -156,58 +262,66 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
         listener.listen(128)  # roomy backlog so a burst of containers isn't refused
         mode = ("no queue" if no_queue else "fan-in") + (", keep-alive" if keep else ", one-shot")
         _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit; "
-              "while attached, Ctrl-C interrupts the target and Ctrl-] drops it")
+              "while attached, Ctrl-C or Ctrl-] drops the session")
 
         def acceptor():
             while not stopping.is_set():
                 try:
                     conn, addr = listener.accept()
                 except OSError:
-                    return  # listener closed -> we're shutting down
+                    return  # listener shut down -> we're exiting
+                with held_lock:
+                    if stopping.is_set():
+                        _hangup(conn)
+                        return
+                    held.add(conn)
                 _enable_keepalive(conn)  # a vanished container must not hold the slot
-                ident = _read_banner(conn) or f"{addr[0]}:{addr[1]}"
-                if stopping.is_set():
-                    conn.close()
-                    return
-                if no_queue and not slot.acquire(blocking=False):
-                    _reply(conn, "continue")
-                    conn.close()
-                    _note(f"continued: {ident}")
-                    continue
-                _reply(conn, f"{cols} {rows}")
-                sessions.put((conn, ident))
-                _note(f"queued: {ident}  ({sessions.qsize()} waiting)")
+                threading.Thread(target=handshake, args=(conn, addr), daemon=True).start()
 
-        threading.Thread(target=acceptor, daemon=True).start()
+        accepting = threading.Thread(target=acceptor, daemon=True)
+        accepting.start()
 
+        last_drop = None
         try:
             while True:
                 conn, ident = sessions.get()
+                if conn not in held:
+                    continue  # released meanwhile (we're shutting down)
                 waiting = sessions.qsize()
                 suffix = f"  ({waiting} still waiting)" if waiting else ""
                 _note(f"attached: {ident}{suffix}")
                 try:
-                    with conn:
-                        dropped = _pump(conn)
+                    outcome = _pump(conn)
+                except KeyboardInterrupt:
+                    now = time.monotonic()
+                    if last_drop is not None and now - last_drop < QUIT_WINDOW:
+                        release(conn)
+                        _note(f"dropped: {ident}")
+                        raise  # second Ctrl-C in a row: quit
+                    last_drop = now
+                    outcome = "dropped"
                 except Exception as exc:  # one bad session must not kill the listener
-                    _note(f"session error ({ident}): {exc!r}")
-                else:
-                    _note(f"{'dropped' if dropped else 'detached'}: {ident}")
+                    outcome = f"session error ({exc!r})"
+                release(conn)
+                if outcome == "stalled":
+                    outcome = f"dropped (not reading input for {SEND_TIMEOUT:g}s)"
+                _note(f"{outcome}: {ident}")
                 if no_queue:
                     slot.release()
                 if not keep:
                     return
         finally:
-            stopping.set()
+            # Release everyone still waiting on us: queued, mid-handshake, and
+            # (once accept() is woken) nobody new gets held after this.
+            with held_lock:
+                stopping.set()
+                pending = list(held)
+                held.clear()
             with contextlib.suppress(OSError):
-                listener.close()  # unblock the acceptor's accept()
-            while True:
-                try:
-                    pending = sessions.get_nowait()[0]
-                except queue.Empty:
-                    break
-                with contextlib.suppress(OSError):
-                    pending.close()
+                listener.shutdown(socket.SHUT_RDWR)  # wakes accept(); close() alone doesn't
+            for conn in pending:
+                _hangup(conn)
+            accepting.join(timeout=1.0)
 
 
 def main(argv=None):

@@ -1,11 +1,19 @@
 """Tests for the fan-in listener: banner parsing, no-container-refused, --no-queue."""
 
+import contextlib
+import fcntl
 import os
+import pty
 import re
+import select
 import socket
+import subprocess
 import sys
+import termios
 import threading
 import time
+
+import pytest
 
 from reverse_ipdb import serve as serve_mod
 
@@ -120,6 +128,7 @@ def test_no_queue_continues_everyone_while_busy():
     def hold_until_remote_closes(conn):   # stand-in for the raw tty bridge
         while conn.recv(65536):
             pass
+        return "detached"
 
     serve_mod._pump = hold_until_remote_closes
     t = threading.Thread(target=serve_mod.serve, args=("127.0.0.1", port, True, True),
@@ -205,3 +214,197 @@ def test_ctrl_bracket_drops_the_attached_session(monkeypatch):
             c.close()
         os.close(stdin_w)
         os.close(stdout_r)
+
+
+class _Listener:
+    """``serve()`` in a thread, with pipes standing in for the terminal."""
+
+    def __init__(self, monkeypatch, keep=True):
+        self.port = _free_port()
+        self.notes = []
+        monkeypatch.setattr(serve_mod, "_note", self.notes.append)
+        stdin_r, self.stdin_w = os.pipe()
+        self.stdout_r, stdout_w = os.pipe()
+        monkeypatch.setattr(sys, "stdin", os.fdopen(stdin_r, "rb", buffering=0))
+        monkeypatch.setattr(sys, "stdout", os.fdopen(stdout_w, "wb", buffering=0))
+        self.thread = threading.Thread(target=serve_mod.serve,
+                                       args=("127.0.0.1", self.port, keep), daemon=True)
+        self.thread.start()
+        self.conns = []
+        assert _wait(lambda: any("listening" in m for m in self.notes))
+
+    def connect(self):
+        c = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.conns.append(c)
+        return c
+
+    def dial(self, name):
+        c = self.connect()
+        c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
+        assert SIZE_LINE.match(_recv_line(c))
+        return c
+
+    def noted(self, text, timeout=5):
+        return _wait(lambda: any(text in m for m in self.notes), timeout)
+
+    def close(self):
+        for c in self.conns:
+            c.close()
+        for fd in (self.stdin_w, self.stdout_r):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+def _released(c, timeout=3):
+    """True once the listener hangs up on ``c`` (whatever it sent before)."""
+    c.settimeout(timeout)
+    try:
+        while c.recv(65536):
+            pass
+    except TimeoutError:
+        return False
+    except OSError:
+        return True  # reset counts as released too
+    return True
+
+
+def test_silent_client_holds_up_nobody(monkeypatch):
+    """A connection that never sends a banner must not stall the queue; it is
+    hung up after BANNER_TIMEOUT."""
+    monkeypatch.setattr(serve_mod, "BANNER_TIMEOUT", 0.5)
+    lst = _Listener(monkeypatch)
+    try:
+        silent = lst.connect()
+        start = time.time()
+        lst.dial("good")                                  # answered despite the silent one
+        assert time.time() - start < 0.4
+        assert lst.noted("queued: good")
+        assert _released(silent)
+        assert lst.noted("ignored: 127.0.0.1")
+    finally:
+        lst.close()
+
+
+def test_target_not_reading_input_is_dropped(monkeypatch):
+    """Keystrokes the target never reads must not wedge the listener: after
+    SEND_TIMEOUT it drops that session and the next one comes up."""
+    monkeypatch.setattr(serve_mod, "SEND_TIMEOUT", 0.5)
+    lst = _Listener(monkeypatch)
+
+    def flood():                                          # type far more than fits in buffers
+        with contextlib.suppress(OSError):
+            while True:
+                os.write(lst.stdin_w, b"x" * 65536)
+
+    try:
+        stuck = socket.socket()
+        stuck.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        stuck.connect(("127.0.0.1", lst.port))
+        lst.conns.append(stuck)
+        stuck.sendall(b"*** reverse_ipdb/pty stuck pid=1 thread=MainThread\n")
+        assert SIZE_LINE.match(_recv_line(stuck))
+        nxt = lst.dial("next")
+        assert lst.noted("attached: stuck")
+        threading.Thread(target=flood, daemon=True).start()
+        assert lst.noted("dropped (not reading input", timeout=20), lst.notes
+        assert lst.noted("attached: next")
+        assert _released(stuck, timeout=10)
+        nxt.sendall(b"alive")
+        assert b"alive" in os.read(lst.stdout_r, 65536)
+    finally:
+        lst.close()
+
+
+def test_exit_releases_every_waiting_container(monkeypatch):
+    """When the listener stops (here: one-shot after the first session), every
+    container it still holds is hung up so it runs on — queued ones and ones
+    still mid-handshake — and the port stops accepting."""
+    lst = _Listener(monkeypatch, keep=False)
+    try:
+        first = lst.dial("first")
+        queued = lst.dial("queued")
+        handshaking = lst.connect()                       # no banner yet (BANNER_TIMEOUT is 5s)
+        assert lst.noted("attached: first")
+        time.sleep(0.2)
+        first.close()                                     # detach -> one-shot serve() returns
+        lst.thread.join(timeout=5)
+        assert not lst.thread.is_alive()
+        assert _released(queued, timeout=2)
+        assert _released(handshaking, timeout=2)
+        with pytest.raises(OSError):
+            socket.create_connection(("127.0.0.1", lst.port), timeout=2)
+    finally:
+        lst.close()
+
+
+LISTENER_UNDER_PTY = """
+import sys
+from reverse_ipdb import serve
+sys.exit(serve.main(["--host", "127.0.0.1", "--port", sys.argv[1], "--keep"]))
+"""
+
+
+def test_ctrl_c_belongs_to_the_listener():
+    """On a real terminal: Ctrl-C is never sent to the target. It drops the
+    attached session; a second one right after quits, releasing whoever is
+    still queued and restoring the terminal. Ctrl-\\ is just a key."""
+    port = _free_port()
+    master, slave = pty.openpty()
+    # Like a shell would: the pty is the listener's controlling terminal, so
+    # Ctrl-C becomes a SIGINT for it (its own session, slave as ctty).
+    proc = subprocess.Popen([sys.executable, "-c", LISTENER_UNDER_PTY, str(port)],
+                            stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+                            start_new_session=True,
+                            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+    os.close(slave)
+    out = bytearray()
+
+    def read_until(text, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            if select.select([master], [], [], 0.1)[0]:
+                try:
+                    out.extend(os.read(master, 65536))
+                except OSError:
+                    break
+            if text.encode() in out:
+                return True
+        return False
+
+    conns = []
+    try:
+        assert read_until("listening")
+
+        def dial(name):
+            c = socket.create_connection(("127.0.0.1", port), timeout=5)
+            c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
+            assert SIZE_LINE.match(_recv_line(c))
+            conns.append(c)
+            return c
+
+        a, b, c = dial("aaa"), dial("bbb"), dial("ccc")
+        assert read_until("attached: aaa")
+        time.sleep(0.3)
+        os.write(master, b"\x03")
+        a.settimeout(3)
+        assert a.recv(65536) == b""                      # hung up, and no \x03 reached it
+        assert read_until("dropped: aaa") and read_until("attached: bbb")
+
+        time.sleep(serve_mod.QUIT_WINDOW + 0.3)            # a lone Ctrl-C: only drops
+        os.write(master, b"\x1c")                          # Ctrl-\ goes through as a key
+        b.settimeout(3)
+        assert b.recv(65536) == b"\x1c"
+        os.write(master, b"\x03")
+        assert _released(b) and read_until("attached: ccc")
+
+        time.sleep(0.3)
+        os.write(master, b"\x03")                          # second Ctrl-C in a row: quit
+        assert proc.wait(timeout=5) == 0
+        assert _released(c)
+        assert termios.tcgetattr(master)[3] & termios.ICANON   # terminal back to cooked
+    finally:
+        for conn in conns:
+            conn.close()
+        if proc.poll() is None:
+            proc.kill()
+        os.close(master)

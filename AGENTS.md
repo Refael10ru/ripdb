@@ -50,13 +50,14 @@ Guarantees callers rely on — **do not break these**:
   FIN on Linux, so a target that keeps running after detach left the
   listener (and everything queued behind it) stuck. `_close_socket` owns this;
   `tests/test_session.py` pins it.
-- **Ctrl-C without signals.** The pty is nobody's controlling terminal, so a
-  `\x03` from the listener raises no SIGINT. The socket->pty pump calls
-  `ReverseIPdb.interrupt()` for it whenever the prompt isn't up: a running
-  command gets `KeyboardInterrupt` (real SIGINT to the main thread when its
-  handler is Python's default, else an async exception); a running program
-  gets `set_step()`, and a second Ctrl-C escalates. Never install a SIGINT
-  handler in the target.
+- **A listener hang-up releases the target.** Closing fds under a blocked
+  prompt never wakes it, so when the socket dies the bridge calls
+  `ReverseIPdb.hang_up()`: it ends the running prompt with `EOFError` (via the
+  prompt's own event loop) or, if none is up, the next one as soon as it
+  starts — the debugger takes that as `detach`. Until then the pty->socket
+  pump keeps reading and discarding, so the debugger's writes (a command's
+  output, the stack at the next breakpoint) neither block nor fail into the
+  program. Only the output pump closes the master, once the slave is closed.
 - **POSIX only.** A pty is required, so the package imports `termios` at the
   top level — `import reverse_ipdb` only works on a Unix platform.
 
@@ -73,10 +74,22 @@ socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
 roster (`queued:` / `attached:` / `detached:`), and puts your terminal in raw
 mode so completion works. With `--no-queue`, while one container
 holds the slot (queued or attached), every other arrival is answered `continue`
-(roster: `continued:`) and runs on as if no listener existed. While attached,
-every key goes to the target except **Ctrl-]**, which drops the session
-locally (roster: `dropped:`) and attaches the next one. Use a **raw**
+(roster: `continued:`) and runs on as if no listener existed. Use a **raw**
 listener — `nc` mangles completion (line-buffered + local echo).
+
+The listener must **never become unresponsive**:
+
+- **Ctrl-C is the listener's.** Raw mode keeps `ISIG` on (with `VQUIT` /
+  `VSUSP` disabled), so Ctrl-C is a SIGINT here and never reaches the target.
+  While attached it drops the session (`dropped:`); a second one within
+  `QUIT_WINDOW`, or one at the idle roster, quits. Ctrl-] drops too.
+- **No socket can block it.** Banners are read by one short-lived thread per
+  connection, bounded by `BANNER_TIMEOUT` (silent clients: `ignored:`), and
+  keystrokes are sent with `SEND_TIMEOUT` (a target not reading is dropped).
+- **Nothing is left paused.** Every accepted connection is tracked until
+  released; on drop, stall or exit each one is hung up (`shutdown` + `close`),
+  and `accept()` is woken with `listener.shutdown()` — `close()` alone
+  doesn't wake it on Linux.
 
 ## Wire protocol (keep stable across both sides)
 
@@ -155,15 +168,19 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   `pty_bridge.py` or the protocol, this is the test that matters.
 - `tests/test_serve.py` — banner parsing, "many containers all queued, none
   refused" (each answered with the size line on arrival), `--no-queue`
-  (one holds the slot, the rest get `continue`, slot frees on detach), and
-  Ctrl-] dropping the attached session so the next one comes up.
+  (one holds the slot, the rest get `continue`, slot frees on detach), Ctrl-]
+  dropping the attached session, a silent client holding up nobody, a target
+  not reading input being dropped, exit releasing everyone still waiting, and
+  — under a real pty — Ctrl-C dropping, a second Ctrl-C quitting, and the
+  terminal restored.
 - `tests/test_handshake.py` — the target's side of the reply line: size /
   `continue` / hang-up / silence, and a `continue`d target resumes without
   importing IPython and can dial again.
 - `tests/test_session.py` — session lifecycle against a real target: detach
   hangs up **while the program keeps running** (the queue-stall regression),
-  `c` without breakpoints detaches, and Ctrl-C interrupts commands (main and
-  worker thread) and running code.
+  `c` without breakpoints detaches, and a **listener** hang-up releases the
+  target — at its prompt, mid-command (output still flowing) and between
+  breakpoints.
 - `tests/test_api.py` — default routing to the pty bridge and aliasing.
 - `tests/test_client.py` — fail-open and shell-lock acquire/release via `dial()`.
 
@@ -176,8 +193,8 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
 - A completion **menu** (several candidates) stays open until dismissed; clear
   the line (Ctrl-U) before typing `detach`.
 - Mid-session terminal **resize** isn't propagated — size is sent once at attach.
-- Ctrl-C in a **worker thread** is an async exception: it can't break a
-  blocking C call (`time.sleep`, `recv`), only land after it returns. The shell
-  prints "KeyboardInterrupt pending" when that happens; Ctrl-] is the way out.
+- There is no way to interrupt a long command on the target from the listener:
+  Ctrl-C drops the session instead, and the target runs on once the command
+  finishes. Clear the input line with Ctrl-U.
 - IPython is a hard dependency (it brings prompt_toolkit); runtime deps = just
   IPython, everything else stdlib.
