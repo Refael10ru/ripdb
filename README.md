@@ -127,12 +127,13 @@ on the spot and runs on untouched, exactly as if no listener were running:
 *** attached: web-7f9c pid=12 thread=MainThread
    … debug web-7f9c; meanwhile other breakpoints just continue, silently …
 *** detached: web-7f9c pid=12 thread=MainThread
-*** continued ×37 while attached: worker-3a1 pid=9 thread=Thread-2 ×36, worker-4b0 pid=3 thread=MainThread
+*** continued ×1201 while attached: worker-3a1 pid=9 (12 threads) ×1200, worker-4b0 pid=3 thread=MainThread
 ```
 
 While you're attached the terminal belongs to that shell, so the listener
 stays quiet; the containers it turned away meanwhile are summed up in one
-line when you detach.
+line when you detach, grouped by process (a loop across many threads is one
+entry, not one per thread).
 
 The bundled `serve` identifies each container by its banner, keeps the fan-in
 roster, and — for IPython (pty) sessions — puts your terminal in raw mode so

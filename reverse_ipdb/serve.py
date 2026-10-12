@@ -69,15 +69,32 @@ def _note_continued(counts):
 
     Printed on detach, never mid-session: while attached, the terminal is in
     raw mode and belongs to the remote shell, and a loop hitting its
-    breakpoint would otherwise spray a line per iteration over it.
+    breakpoint would otherwise spray a line per iteration over it. Grouped by
+    process, since many threads passing the same breakpoint would otherwise
+    each be their own entry.
     """
     if not counts:
         return
-    top = counts.most_common(3)
-    who = ", ".join(f"{ident} ×{n}" if n > 1 else ident for ident, n in top)
-    more = len(counts) - len(top)
-    if more:
-        who += f", +{more} more"
+    per_proc = collections.Counter()
+    threads = collections.defaultdict(set)
+    for ident, n in counts.items():
+        proc, _, thread = ident.partition(" thread=")
+        per_proc[proc] += n
+        threads[proc].add(thread)
+
+    def describe(proc, n):
+        names = threads[proc] - {""}
+        who = proc
+        if len(names) == 1:
+            who += f" thread={names.pop()}"
+        elif names:
+            who += f" ({len(names)} threads)"
+        return f"{who} ×{n}" if n > 1 else who
+
+    top = per_proc.most_common(3)
+    who = ", ".join(describe(proc, n) for proc, n in top)
+    if len(per_proc) > len(top):
+        who += f", +{len(per_proc) - len(top)} more"
     _note(f"continued ×{sum(counts.values())} while attached: {who}")
     counts.clear()
 
