@@ -55,7 +55,8 @@ debugger exists.
 - `dial()` — acquires the shell lock, then dials the listener with a short
   timeout and **fails open** (returns `None`, releasing the lock) when nobody
   is listening. Returns `(sock, release)` otherwise.
-- `banner()` — the `*** reverse_ipdb/pty …` identity line sent first.
+- `banner()` — the identity line sent first: a JSON object (`protocol.py`)
+  tagged `"reverse_ipdb": "pty"` with `host` / `pid` / `thread`.
 - The module-level **single-shell lock** — the first thread to reach a
   breakpoint wins the shell; concurrent arrivals get `None` and pass through.
   The lock is held for the whole session and released by `release()` when the

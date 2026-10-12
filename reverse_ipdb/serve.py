@@ -11,9 +11,10 @@ Usage::
 
 Without ``--keep`` the listener serves the first container and exits. With
 ``--keep`` it keeps serving: detach from one and you drop straight into the
-next one waiting. With ``--no-queue`` nobody waits: while one container is
-attached, every other one that dials in is told to ``continue`` on the spot
-and runs on as if no listener existed.
+next one waiting. With ``--no-queue [SECONDS]`` nobody waits: while one
+container is attached, every other one that dials in is told to ``continue``
+on the spot, runs on as if no listener existed, and stays away for SECONDS
+(default 1) before it dials again.
 """
 
 import argparse
@@ -28,6 +29,8 @@ import termios
 import threading
 import tty
 
+from reverse_ipdb import protocol
+
 
 def _note(msg):
     """Print a roster line to stderr, flushed so it shows up live."""
@@ -35,26 +38,13 @@ def _note(msg):
 
 
 def _read_banner(conn):
-    """Read the target's first line and return its human identity.
-
-    Byte-at-a-time so we never over-read into the debugger output that
-    follows — those bytes must stay in the socket for the pump to stream.
-    The line looks like ``*** reverse_ipdb/pty <host> pid=.. thread=..``; the
-    ``reverse_ipdb/pty`` tag is stripped, leaving ``<host> pid=.. thread=..``.
+    """The target's identity from its banner: ``<host> pid=.. thread=..``,
+    built from whichever of those keys it sent (``""`` if none).
     """
-    buf = bytearray()
-    while not buf.endswith(b"\n"):
-        try:
-            chunk = conn.recv(1)
-        except OSError:
-            break
-        if not chunk:
-            break
-        buf += chunk
-    text = buf.decode("utf-8", "replace").strip().lstrip("* ").strip()
-    if text.startswith("reverse_ipdb/"):
-        _, _, text = text.partition(" ")  # drop the "reverse_ipdb/<mode>" tag
-    return text.strip()
+    msg = protocol.decode(protocol.read_line(conn) or b"")
+    parts = [str(msg["host"])] if "host" in msg else []
+    parts += [f"{key}={msg[key]}" for key in ("pid", "thread") if key in msg]
+    return " ".join(parts)
 
 
 def _terminal_size():
@@ -99,10 +89,10 @@ def _note_continued(counts):
     counts.clear()
 
 
-def _reply(conn, line):
-    """Answer a banner with one protocol line (``"cols rows"`` or ``"continue"``)."""
+def _reply(conn, fields):
+    """Answer a banner with one protocol line (see ``protocol``)."""
     with contextlib.suppress(OSError):
-        conn.sendall(f"{line}\n".encode())
+        conn.sendall(protocol.encode(fields))
 
 
 def _pump(conn):
@@ -139,15 +129,16 @@ def _pump(conn):
                 termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
+def serve(host="0.0.0.0", port=4444, keep=False, no_queue=None):
     """Fan in reverse-pdb sessions: accept all, serve one at a time.
 
     A background thread accepts every incoming container, reads its banner and
     answers it at once. By default the answer is our terminal size and the
     container is queued (so nothing is refused and each stays paused); the
     foreground pops them in arrival order and drives one at a time. With
-    ``no_queue``, only one container holds the slot — attached or queued — and
-    every other one is answered ``continue`` and runs on immediately.
+    ``no_queue`` (a cooldown in seconds), only one container holds the slot —
+    attached or queued — and every other one is answered ``continue`` with a
+    ``cooldown``: it runs on immediately and doesn't dial again for that long.
     """
     sessions = queue.Queue()
     stopping = threading.Event()
@@ -159,7 +150,8 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((host, port))
         listener.listen(128)  # roomy backlog so a burst of containers isn't refused
-        mode = ("no queue" if no_queue else "fan-in") + (", keep-alive" if keep else ", one-shot")
+        mode = ("fan-in" if no_queue is None else f"no queue, {no_queue:g}s cooldown")
+        mode += ", keep-alive" if keep else ", one-shot"
         _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit")
 
         def acceptor():
@@ -172,12 +164,12 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
                 if stopping.is_set():
                     conn.close()
                     return
-                if no_queue and not slot.acquire(blocking=False):
-                    _reply(conn, "continue")
+                if no_queue is not None and not slot.acquire(blocking=False):
+                    _reply(conn, {"continue": True, "cooldown": no_queue})
                     conn.close()
                     continued[ident] += 1  # reported in one line on detach
                     continue
-                _reply(conn, f"{cols} {rows}")
+                _reply(conn, {"cols": cols, "rows": rows})
                 sessions.put((conn, ident))
                 _note(f"queued: {ident}  ({sessions.qsize()} waiting)")
 
@@ -196,7 +188,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
                     _note(f"session error ({ident}): {exc!r}")
                 else:
                     _note(f"detached: {ident}")
-                if no_queue:
+                if no_queue is not None:
                     _note_continued(continued)
                     slot.release()
                 if not keep:
@@ -226,9 +218,10 @@ def main(argv=None):
     parser.add_argument("--keep", action="store_true",
                         help="after a detach, drop into the next waiting container "
                              "instead of exiting")
-    parser.add_argument("--no-queue", action="store_true",
+    parser.add_argument("--no-queue", nargs="?", const=1.0, type=float, metavar="SECONDS",
                         help="don't queue: while a container is attached, any other "
-                             "that dials in is told to continue and runs on")
+                             "that dials in is told to continue, and to stay away for "
+                             "SECONDS (default 1) before dialing again")
     args = parser.parse_args(argv)
     try:
         serve(args.host, args.port, args.keep, args.no_queue)

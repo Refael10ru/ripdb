@@ -75,6 +75,7 @@ Configuration resolves **argument → environment variable → default**:
 uv run reverse_ipdb-serve               # serve the first container, then exit
 uv run reverse_ipdb-serve --keep        # fan-in: detach one, drop into the next waiting
 uv run reverse_ipdb-serve --keep --no-queue  # don't queue: everyone else just continues
+uv run reverse_ipdb-serve --keep --no-queue 5  # …and stays away 5s before dialing again
 uv run reverse_ipdb-serve --port 4444   # pick the port
 # (or: python -m reverse_ipdb.serve, once the package is installed)
 ```
@@ -119,10 +120,11 @@ what forward debuggers like madbg can't do: there you'd chase N endpoints.)
 
 Don't want a queue? Add `--no-queue`. Then only one container is yours at a
 time; every other one that hits a breakpoint meanwhile is told to **continue**
-on the spot and runs on untouched, exactly as if no listener were running:
+on the spot and runs on untouched, exactly as if no listener were running
+(`--no-queue 5` also tells it to stay away for 5 seconds; the default is 1):
 
 ```
-*** reverse_ipdb listening on 0.0.0.0:4444 (no queue, keep-alive) — Ctrl-C to quit
+*** reverse_ipdb listening on 0.0.0.0:4444 (no queue, 1s cooldown, keep-alive) — Ctrl-C to quit
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread
    … debug web-7f9c; meanwhile other breakpoints just continue, silently …
@@ -133,8 +135,9 @@ on the spot and runs on untouched, exactly as if no listener were running:
 While you're attached the terminal belongs to that shell, so the listener
 stays quiet; the containers it turned away meanwhile are summed up in one
 line when you detach, grouped by process (a loop across many threads is one
-entry, not one per thread). A thread that was told to continue also stops
-dialing for a second, so a hot loop doesn't pay a round trip per pass.
+entry, not one per thread). A thread that was told to continue also stays
+away for the cooldown you chose, so a hot loop doesn't pay a round trip per
+pass.
 
 The bundled `serve` identifies each container by its banner, keeps the fan-in
 roster, and — for IPython (pty) sessions — puts your terminal in raw mode so

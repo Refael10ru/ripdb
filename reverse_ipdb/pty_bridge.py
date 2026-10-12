@@ -22,7 +22,7 @@ import termios
 import threading
 import traceback
 
-from reverse_ipdb import client
+from reverse_ipdb import client, protocol
 
 DEFAULT_COLS, DEFAULT_ROWS = 80, 24
 SIZE_TIMEOUT = 0.5  # how long to wait for the listener's terminal size
@@ -65,32 +65,32 @@ def _set_winsize(fd, cols, rows):
 
 
 def _handshake(sock):
-    """Send our banner and read the listener's one-line reply.
+    """Send our banner and read the listener's reply (see ``protocol``).
 
-    ``"cols rows\\n"`` -> that terminal size. ``"continue\\n"``, or the listener
-    hanging up -> ``None``: no shell for us, run on. A plain socat/nc listener
-    never replies, so after ``SIZE_TIMEOUT`` we fall back to a default size.
+    ``{"cols": .., "rows": ..}`` -> that pty size, defaults for what's missing.
+    ``{"continue": true}`` -> ``None``: no shell for us, run on — and with
+    ``"cooldown": <seconds>`` this thread doesn't dial again for that long.
+    The listener hanging up -> ``None`` too. A plain socat/nc listener never
+    replies, so after ``SIZE_TIMEOUT`` we fall back to the default size.
     """
     sock.settimeout(SIZE_TIMEOUT)
-    buf = bytearray()
     try:
-        sock.sendall(client.banner().encode("utf-8"))
-        while not buf.endswith(b"\n") and len(buf) < 32:
-            chunk = sock.recv(1)
-            if not chunk:
-                return None  # listener hung up
-            buf += chunk
-    except TimeoutError:
-        pass  # a plain socat/nc listener never replies
+        sock.sendall(client.banner())
     except OSError:
-        return None  # listener gone
+        return None
+    line = protocol.read_line(sock)
+    if line is None:
+        return None
     sock.settimeout(None)
-    if buf.strip() == b"continue":
+    reply = protocol.decode(line)
+    if reply.get("continue"):
+        if reply.get("cooldown"):
+            with contextlib.suppress(TypeError, ValueError):
+                client.cool_down(float(reply["cooldown"]))
         return None
     try:
-        cols, rows = (int(x) for x in buf.split())
-        return cols, rows
-    except ValueError:
+        return int(reply.get("cols", DEFAULT_COLS)), int(reply.get("rows", DEFAULT_ROWS))
+    except (TypeError, ValueError):
         return DEFAULT_COLS, DEFAULT_ROWS
 
 
@@ -142,11 +142,9 @@ def run(frame, host=None, port=None):
 
     # Banner out, one reply line back. A listener that answers "continue"
     # (reverse_ipdb-serve --no-queue while it's busy) gets no shell from us:
-    # hang up, run on without ever importing the debugger, and don't dial
-    # again from this thread for a while.
+    # hang up and run on, without ever importing the debugger.
     size = _handshake(sock)
     if size is None:
-        client.cool_down()
         _hangup(sock, release)
         return
     cols, rows = size

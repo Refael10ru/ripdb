@@ -1,6 +1,8 @@
 """Tests for target-side dial logic: resolution, fail-open, shell lock, banner."""
 
 import contextlib
+import json
+import os
 import socket
 import threading
 
@@ -26,10 +28,12 @@ def test_resolve_target_args_win(monkeypatch):
     assert client.resolve_target(host="1.2.3.4", port=1234) == ("1.2.3.4", 1234)
 
 
-def test_banner_is_pty_tagged():
+def test_banner_is_a_pty_tagged_identity():
     line = client.banner()
-    assert line.startswith("*** reverse_ipdb/pty ")
-    assert "pid=" in line and "thread=" in line and line.endswith("\n")
+    assert line.endswith(b"\n")
+    msg = json.loads(line)
+    assert msg["reverse_ipdb"] == "pty"
+    assert msg["pid"] == os.getpid() and msg["thread"] == "MainThread" and msg["host"]
 
 
 def test_dial_no_listener_returns_none_and_releases_lock():
@@ -81,7 +85,7 @@ def test_cool_down_is_per_thread():
         return dialed
 
     try:
-        client.cool_down()
+        client.cool_down(60)
         assert dial_and_hang_up() is None                 # this thread: no dial at all
         assert not client._shell_lock.locked()
 
