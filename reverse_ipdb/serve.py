@@ -11,7 +11,7 @@ Usage::
 
 Without ``--keep`` the listener serves the first container and exits. With
 ``--keep`` it keeps serving: detach from one and you drop straight into the
-next one waiting. With ``--single`` nothing waits: while one container is
+next one waiting. With ``--no-queue`` nobody waits: while one container is
 attached, every other one that dials in is told to ``continue`` on the spot
 and runs on as if no listener existed.
 """
@@ -103,26 +103,26 @@ def _pump(conn):
                 termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def serve(host="0.0.0.0", port=4444, keep=False, single=False):
+def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
     """Fan in reverse-pdb sessions: accept all, serve one at a time.
 
     A background thread accepts every incoming container, reads its banner and
     answers it at once. By default the answer is our terminal size and the
     container is queued (so nothing is refused and each stays paused); the
     foreground pops them in arrival order and drives one at a time. With
-    ``single``, only one container holds the slot — attached or queued — and
+    ``no_queue``, only one container holds the slot — attached or queued — and
     every other one is answered ``continue`` and runs on immediately.
     """
     sessions = queue.Queue()
     stopping = threading.Event()
-    slot = threading.Lock()   # --single: held from queueing until detach
+    slot = threading.Lock()   # --no-queue: held from arrival until detach
     cols, rows = _terminal_size()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((host, port))
         listener.listen(128)  # roomy backlog so a burst of containers isn't refused
-        mode = ("single" if single else "fan-in") + (", keep-alive" if keep else ", one-shot")
+        mode = ("no queue" if no_queue else "fan-in") + (", keep-alive" if keep else ", one-shot")
         _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit")
 
         def acceptor():
@@ -135,7 +135,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, single=False):
                 if stopping.is_set():
                     conn.close()
                     return
-                if single and not slot.acquire(blocking=False):
+                if no_queue and not slot.acquire(blocking=False):
                     _reply(conn, "continue")
                     conn.close()
                     _note(f"continued: {ident}")
@@ -159,7 +159,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, single=False):
                     _note(f"session error ({ident}): {exc!r}")
                 else:
                     _note(f"detached: {ident}")
-                if single:
+                if no_queue:
                     slot.release()
                 if not keep:
                     return
@@ -188,13 +188,12 @@ def main(argv=None):
     parser.add_argument("--keep", action="store_true",
                         help="after a detach, drop into the next waiting container "
                              "instead of exiting")
-    parser.add_argument("--single", action="store_true",
-                        help="one container at a time: while one is attached, any "
-                             "other that dials in is told to continue instead of "
-                             "being queued")
+    parser.add_argument("--no-queue", action="store_true",
+                        help="don't queue: while a container is attached, any other "
+                             "that dials in is told to continue and runs on")
     args = parser.parse_args(argv)
     try:
-        serve(args.host, args.port, args.keep, args.single)
+        serve(args.host, args.port, args.keep, args.no_queue)
     except KeyboardInterrupt:
         print("\n*** bye", file=sys.stderr)
         return 0

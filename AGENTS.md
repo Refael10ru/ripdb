@@ -50,14 +50,14 @@ Guarantees callers rely on — **do not break these**:
 
 ```sh
 uv run reverse_ipdb-serve --keep          # fan-in: serve one container, detach, next…
-uv run reverse_ipdb-serve --keep --single # one at a time: the others are told to continue
+uv run reverse_ipdb-serve --keep --no-queue # don't queue: the others are told to continue
 python -m reverse_ipdb.serve --keep       # same, without uv
 socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
 ```
 
 `reverse_ipdb-serve` accepts every container immediately (none refused), shows a live
 roster (`queued:` / `attached:` / `detached:`), and puts your terminal in raw
-mode so completion works. With `--single` nothing queues: while one container
+mode so completion works. With `--no-queue`, while one container
 holds the slot (queued or attached), every other arrival is answered `continue`
 (roster: `continued:`) and runs on as if no listener existed. Use a **raw**
 listener — `nc` mangles completion (line-buffered + local echo).
@@ -83,7 +83,7 @@ reverse_ipdb/
   client.py      dial() + shell lock + banner(); resolve_target()
   pty_bridge.py  open pty, run TerminalPdb on it, pump <-> socket, teardown
   debugger.py    ReverseIPdb (TerminalPdb) + DetachMixin
-  serve.py       fan-in listener: accept-all + roster + raw pty pass-through (--single)
+  serve.py       fan-in listener: accept-all + roster + raw pty pass-through (--no-queue)
 ```
 
 Completion mechanism, in one line: IPython's `TerminalPdb.cmdloop` rebinds its
@@ -136,7 +136,7 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   must exit 0 after detach (no leaked prompt_toolkit threads). If you touch
   `pty_bridge.py` or the protocol, this is the test that matters.
 - `tests/test_serve.py` — banner parsing, "many containers all queued, none
-  refused" (each answered with the size line on arrival), and `--single`
+  refused" (each answered with the size line on arrival), and `--no-queue`
   (one holds the slot, the rest get `continue`, slot frees on detach).
 - `tests/test_handshake.py` — the target's side of the reply line: size /
   `continue` / hang-up / silence, and a `continue`d target resumes without

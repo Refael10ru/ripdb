@@ -1,4 +1,4 @@
-"""Tests for the fan-in listener: banner parsing, no-container-refused, --single."""
+"""Tests for the fan-in listener: banner parsing, no-container-refused, --no-queue."""
 
 import re
 import socket
@@ -107,9 +107,9 @@ def test_simultaneous_containers_are_all_queued_none_refused():
             c.close()
 
 
-def test_single_mode_continues_everyone_while_busy():
-    """--single: one container holds the slot; the rest are told to continue
-    (no queue), and the slot frees up on detach."""
+def test_no_queue_continues_everyone_while_busy():
+    """--no-queue: one container holds the slot; the rest are told to continue,
+    and the slot frees up on detach."""
     port = _free_port()
     notes = []
     original_note, original_pump = serve_mod._note, serve_mod._pump
@@ -156,10 +156,10 @@ def test_single_mode_continues_everyone_while_busy():
         serve_mod._note, serve_mod._pump = original_note, original_pump
 
 
-def test_single_flag_is_wired(monkeypatch):
+def test_no_queue_flag_is_wired(monkeypatch):
     captured = {}
     monkeypatch.setattr(serve_mod, "serve",
-                        lambda host, port, keep, single: captured.update(
-                            keep=keep, single=single))
-    serve_mod.main(["--single", "--keep"])
-    assert captured == {"keep": True, "single": True}
+                        lambda host, port, keep, no_queue: captured.update(
+                            keep=keep, no_queue=no_queue))
+    serve_mod.main(["--no-queue", "--keep"])
+    assert captured == {"keep": True, "no_queue": True}
