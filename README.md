@@ -133,7 +133,8 @@ on the spot and runs on untouched, exactly as if no listener were running:
 While you're attached the terminal belongs to that shell, so the listener
 stays quiet; the containers it turned away meanwhile are summed up in one
 line when you detach, grouped by process (a loop across many threads is one
-entry, not one per thread).
+entry, not one per thread). A thread that was told to continue also stops
+dialing for a second, so a hot loop doesn't pay a round trip per pass.
 
 The bundled `serve` identifies each container by its banner, keeps the fan-in
 roster, and — for IPython (pty) sessions — puts your terminal in raw mode so

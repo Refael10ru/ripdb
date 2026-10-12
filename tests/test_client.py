@@ -65,10 +65,45 @@ def test_dial_holds_lock_until_release():
         srv.close()
 
 
+def test_cool_down_is_per_thread():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(2)
+    srv.settimeout(5)
+    port = srv.getsockname()[1]
+
+    def dial_and_hang_up():
+        dialed = client.dial(host="127.0.0.1", port=port)
+        if dialed is not None:
+            dialed[0].close()
+            dialed[1]()
+        return dialed
+
+    try:
+        client.cool_down()
+        assert dial_and_hang_up() is None                 # this thread: no dial at all
+        assert not client._shell_lock.locked()
+
+        other = []
+        t = threading.Thread(target=lambda: other.append(dial_and_hang_up()))
+        t.start()
+        t.join()
+        assert other[0] is not None                       # another thread: dials
+        srv.accept()[0].close()
+
+        client._local.skip_until = 0.0                    # cooldown over
+        assert dial_and_hang_up() is not None
+        srv.accept()[0].close()
+    finally:
+        srv.close()
+
+
 @pytest.fixture(autouse=True)
 def _reset_lock():
-    # Guard against a leaked lock from a failed assertion in another test.
+    # Guard against a leaked lock / cooldown from a failed assertion in another test.
     yield
+    client._local.skip_until = 0.0
     if client._shell_lock.locked():
         with contextlib.suppress(RuntimeError):
             client._shell_lock.release()

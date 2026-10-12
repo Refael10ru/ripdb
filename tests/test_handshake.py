@@ -8,6 +8,9 @@ lock and resume — without ever importing IPython.
 import socket
 import subprocess
 import sys
+import textwrap
+
+import pytest
 
 from reverse_ipdb import pty_bridge
 
@@ -55,13 +58,15 @@ def test_continue_resumes_target_without_importing_ipython():
     srv.bind(("127.0.0.1", 0))
     srv.listen(2)
     port = srv.getsockname()[1]
-    src = (
-        "import sys, reverse_ipdb; "
-        f"reverse_ipdb.set_trace(host='127.0.0.1', port={port}); "
-        f"reverse_ipdb.set_trace(host='127.0.0.1', port={port}); "   # lock was released
-        "print('RESUMED', any(m.split('.')[0] in ('IPython', 'prompt_toolkit') "
-        "for m in sys.modules))"
-    )
+    src = textwrap.dedent(f"""
+        import sys, threading, reverse_ipdb
+        bp = lambda: reverse_ipdb.set_trace(host='127.0.0.1', port={port})
+        bp()                                   # main thread: told to continue
+        t = threading.Thread(target=bp); t.start(); t.join()   # other thread: dials too
+        bp()                                   # main thread again, cooling down: no dial
+        print('RESUMED', any(m.split('.')[0] in ('IPython', 'prompt_toolkit')
+                             for m in sys.modules))
+        """)
     proc = subprocess.Popen([sys.executable, "-c", src],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
@@ -76,6 +81,9 @@ def test_continue_resumes_target_without_importing_ipython():
             conn.sendall(b"continue\n")
             assert conn.recv(1) == b""     # target hung up, no pty output
             conn.close()
+        srv.settimeout(1)
+        with pytest.raises(TimeoutError):   # the third breakpoint never dialed
+            srv.accept()
         stdout, stderr = proc.communicate(timeout=15)
     finally:
         srv.close()

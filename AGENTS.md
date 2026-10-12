@@ -62,7 +62,10 @@ holds the slot (queued or attached), every other arrival is answered `continue`
 and runs on as if no listener existed; those are reported in **one digest
 line on detach** (`continued ×N while attached: …`), never mid-session — the
 terminal is in raw mode and belongs to the remote shell then, so a loop
-hitting its breakpoint must not spray lines over it. Use a **raw**
+hitting its breakpoint must not spray lines over it. On the target, a thread
+told to `continue` doesn't dial again for `client.CONTINUE_COOLDOWN` (1s) —
+tracked in a thread-local, so a hot loop across many threads costs no round
+trip per pass and other threads are unaffected. Use a **raw**
 listener — `nc` mangles completion (line-buffered + local echo).
 
 ## Wire protocol (keep stable across both sides)
@@ -146,7 +149,8 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   `continue` / hang-up / silence, and a `continue`d target resumes without
   importing IPython and can dial again.
 - `tests/test_api.py` — default routing to the pty bridge and aliasing.
-- `tests/test_client.py` — fail-open and shell-lock acquire/release via `dial()`.
+- `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,
+  and the per-thread `continue` cooldown.
 
 ## Gotchas
 

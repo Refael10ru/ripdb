@@ -142,9 +142,11 @@ def run(frame, host=None, port=None):
 
     # Banner out, one reply line back. A listener that answers "continue"
     # (reverse_ipdb-serve --no-queue while it's busy) gets no shell from us:
-    # hang up and run on, without ever importing the debugger.
+    # hang up, run on without ever importing the debugger, and don't dial
+    # again from this thread for a while.
     size = _handshake(sock)
     if size is None:
+        client.cool_down()
         _hangup(sock, release)
         return
     cols, rows = size
