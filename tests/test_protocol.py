@@ -5,13 +5,14 @@ import socket
 from reverse_ipdb import protocol
 
 
-def test_encode_decode_roundtrip_drops_none():
-    line = protocol.encode({"cols": 120, "rows": 40, "cooldown": None})
+def test_encode_decode_roundtrip():
+    line = protocol.encode({"cols": 120, "rows": 40})
     assert line.endswith(b"\n")
     assert protocol.decode(line) == {"cols": 120, "rows": 40}
 
 
 def test_decode_tolerates_garbage_and_non_objects():
+    assert protocol.decode(None) == {}                 # read_line's hang-up
     assert protocol.decode(b"") == {}
     assert protocol.decode(b"80 24\n") == {}          # the pre-JSON size line
     assert protocol.decode(b"[1, 2]\n") == {}

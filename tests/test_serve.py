@@ -49,16 +49,6 @@ def _is_size(line):
     return isinstance(msg.get("cols"), int) and isinstance(msg.get("rows"), int)
 
 
-def _recv_line(c):
-    buf = bytearray()
-    while not buf.endswith(b"\n"):
-        chunk = c.recv(1)
-        if not chunk:
-            break
-        buf += chunk
-    return bytes(buf)
-
-
 def _wait(pred, timeout=5):
     end = time.time() + timeout
     while time.time() < end:
@@ -118,7 +108,7 @@ def test_simultaneous_containers_are_all_queued_none_refused():
         # (not only when attached, which could be minutes later).
         for c in conns:
             c.settimeout(5)
-            assert _is_size(_recv_line(c)), c
+            assert _is_size(protocol.read_line(c)), c
     finally:
         serve_mod._note = original_note
         for c in conns:
@@ -152,12 +142,13 @@ def test_no_queue_continues_everyone_while_busy():
             return c
 
         first = dial("first")
-        assert _is_size(_recv_line(first))                    # gets a shell
+        assert _is_size(protocol.read_line(first))                    # gets a shell
         assert _wait(lambda: any("attached: first" in m for m in notes))
 
         for _ in range(3):                                     # a loop hitting its breakpoint
             second = dial("second")
-            assert protocol.decode(_recv_line(second)) == {"continue": True, "cooldown": 2.5}
+            reply = protocol.decode(protocol.read_line(second))
+            assert reply == {"continue": True, "cooldown": 2.5}
             assert second.recv(1) == b""                       # and hung up
         assert not any("continued" in m or "queued: second" in m for m in notes), notes
 
@@ -170,7 +161,7 @@ def test_no_queue_continues_everyone_while_busy():
             for m in notes)), notes
 
         third = dial("third")
-        assert _is_size(_recv_line(third))                    # slot is free again
+        assert _is_size(protocol.read_line(third))                    # slot is free again
         assert _wait(lambda: any("attached: third" in m for m in notes))
     finally:
         for c in conns:

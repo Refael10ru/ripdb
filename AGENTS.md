@@ -57,16 +57,19 @@ socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
 
 `reverse_ipdb-serve` accepts every container immediately (none refused), shows a live
 roster (`queued:` / `attached:` / `detached:`), and puts your terminal in raw
-mode so completion works. With `--no-queue`, while one container
-holds the slot (queued or attached), every other arrival is answered `continue`
-and runs on as if no listener existed; those are reported in **one digest
-line on detach** (`continued ×N while attached: …`), never mid-session — the
-terminal is in raw mode and belongs to the remote shell then, so a loop
-hitting its breakpoint must not spray lines over it. The reply also carries
-a cooldown (`--no-queue SECONDS`, default 1): the turned-away thread doesn't
-dial again for that long — tracked in a thread-local, so a hot loop across
-many threads costs no round trip per pass and other threads are unaffected.
-Use a **raw** listener — `nc` mangles completion (line-buffered + local echo).
+mode so completion works. Use a **raw** listener — `nc` mangles completion
+(line-buffered + local echo).
+
+`--no-queue [SECONDS]`: while one container holds the slot (queued or
+attached), every other arrival is answered `continue` and runs on as if no
+listener existed. Two things keep a hot loop harmless:
+
+- **The listener stays silent while attached** — the terminal is in raw mode
+  and belongs to the remote shell then — and prints one digest on detach
+  (`continued ×N while attached: <host> pid=<pid> (<k> threads) ×n, …`).
+- **The turned-away thread cools down** for SECONDS (default 1) before it
+  dials again, tracked in a thread-local on the target so other threads are
+  unaffected.
 
 ## Wire protocol (keep stable across both sides)
 

@@ -20,16 +20,16 @@ LINE_LIMIT = 4096  # a handshake line longer than this is not one of ours
 
 
 def encode(fields):
-    """One line carrying ``fields``; entries whose value is ``None`` are left out."""
-    present = {k: v for k, v in fields.items() if v is not None}
-    return (json.dumps(present) + "\n").encode("utf-8")
+    """One line carrying ``fields``."""
+    return (json.dumps(fields) + "\n").encode("utf-8")
 
 
 def decode(line):
-    """The dict a line carries. Anything that isn't a JSON object decodes to ``{}``."""
+    """The dict a line carries. Anything that isn't a JSON object (``None``
+    from ``read_line`` included) decodes to ``{}``."""
     try:
         msg = json.loads(line)
-    except ValueError:
+    except (TypeError, ValueError):
         return {}
     return msg if isinstance(msg, dict) else {}
 

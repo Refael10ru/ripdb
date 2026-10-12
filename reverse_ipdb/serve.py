@@ -41,7 +41,7 @@ def _read_banner(conn):
     """The target's identity from its banner: ``<host> pid=.. thread=..``,
     built from whichever of those keys it sent (``""`` if none).
     """
-    msg = protocol.decode(protocol.read_line(conn) or b"")
+    msg = protocol.decode(protocol.read_line(conn))
     parts = [str(msg["host"])] if "host" in msg else []
     parts += [f"{key}={msg[key]}" for key in ("pid", "thread") if key in msg]
     return " ".join(parts)
