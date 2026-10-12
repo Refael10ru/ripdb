@@ -22,11 +22,6 @@ import termios
 import threading
 import traceback
 
-from reverse_ipdb import client
-
-DEFAULT_COLS, DEFAULT_ROWS = 80, 24
-SIZE_TIMEOUT = 0.5  # how long to wait for the listener's terminal size
-
 
 @contextlib.contextmanager
 def _tolerate_shutdown_state():
@@ -64,36 +59,6 @@ def _set_winsize(fd, cols, rows):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def _handshake(sock):
-    """Send our banner and read the listener's one-line reply.
-
-    ``"cols rows\\n"`` -> that terminal size. ``"continue\\n"``, or the listener
-    hanging up -> ``None``: no shell for us, run on. A plain socat/nc listener
-    never replies, so after ``SIZE_TIMEOUT`` we fall back to a default size.
-    """
-    sock.settimeout(SIZE_TIMEOUT)
-    buf = bytearray()
-    try:
-        sock.sendall(client.banner().encode("utf-8"))
-        while not buf.endswith(b"\n") and len(buf) < 32:
-            chunk = sock.recv(1)
-            if not chunk:
-                return None  # listener hung up
-            buf += chunk
-    except TimeoutError:
-        pass  # a plain socat/nc listener never replies
-    except OSError:
-        return None  # listener gone
-    sock.settimeout(None)
-    if buf.strip() == b"continue":
-        return None
-    try:
-        cols, rows = (int(x) for x in buf.split())
-        return cols, rows
-    except ValueError:
-        return DEFAULT_COLS, DEFAULT_ROWS
-
-
 def _pump(src_read, dst_write, on_eof):
     """Copy src -> dst until either side dies, then fire on_eof once."""
     try:
@@ -108,13 +73,6 @@ def _pump(src_read, dst_write, on_eof):
         on_eof()
 
 
-def _hangup(sock, release):
-    """Give the socket and the shell lock back; later breakpoints can dial again."""
-    with contextlib.suppress(OSError):
-        sock.close()
-    release()
-
-
 def _abort(sock, release, reason):
     """Fail open after dialing: say why on stderr and on the listener, then
     hang up so the program runs on and later breakpoints still work.
@@ -124,31 +82,18 @@ def _abort(sock, release, reason):
         sys.stderr.write(text)
     with contextlib.suppress(OSError):
         sock.sendall(text.encode("utf-8", "replace"))
-    _hangup(sock, release)
+    release()
 
 
-def run(frame, host=None, port=None):
-    """Dial out and drop ``frame`` into IPython's debugger over a pty.
+def run(frame, sock, release, cols, rows):
+    """Drop ``frame`` into IPython's debugger over a pty, on a live ``sock``.
 
-    No listener (or a shell already active elsewhere) -> no-op, program runs on.
-    A listener that replies ``continue`` -> same no-op, nothing imported.
-    A debugger that fails to import -> reported on stderr and to the listener,
-    then the program runs on as well; never raises into the debugged program.
+    Layer 2 (``client.attach``) already dialed and handshook; ``release``
+    closes the socket and frees the shell lock, and is called exactly when the
+    session ends, however it ends. A debugger that fails to import is reported
+    on stderr and to the listener, then the program runs on; nothing here ever
+    raises into the debugged program.
     """
-    dialed = client.dial(host, port)
-    if dialed is None:
-        return
-    sock, release = dialed
-
-    # Banner out, one reply line back. A listener that answers "continue"
-    # (reverse_ipdb-serve --no-queue while it's busy) gets no shell from us:
-    # hang up and run on, without ever importing the debugger.
-    size = _handshake(sock)
-    if size is None:
-        _hangup(sock, release)
-        return
-    cols, rows = size
-
     # Imported here, not at module top, on purpose: it keeps `import
     # reverse_ipdb` from pulling in IPython/prompt_toolkit (and, via IPython,
     # concurrent.futures) at import time. That preserves the fail-open cheap
@@ -198,11 +143,10 @@ def run(frame, host=None, port=None):
             closed = True
         with contextlib.suppress(Exception):
             dbg.thread_executor.shutdown(wait=False)  # TerminalPdb's prompt thread
-        for closer in (lambda: os.close(master_fd),
-                       slave_in.close, slave_out.close, sock.close):
+        for closer in (lambda: os.close(master_fd), slave_in.close, slave_out.close):
             with contextlib.suppress(OSError):
                 closer()
-        release()
+        release()  # closes the socket, frees the shell lock
 
     dbg._reverse_ipdb_close = close
 

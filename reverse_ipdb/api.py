@@ -13,8 +13,7 @@ POSIX only: the pty machinery (and so this package) imports ``termios``, so
 import os
 import sys
 
-from reverse_ipdb import pty_bridge
-from reverse_ipdb.client import DOCKER_HOST
+from reverse_ipdb import client
 
 
 def set_trace(*, host=None, port=None, frame=None):
@@ -34,7 +33,7 @@ def set_trace(*, host=None, port=None, frame=None):
             caller's frame is used — i.e. execution pauses at the ``set_trace``
             call site. Rarely passed explicitly.
     """
-    pty_bridge.run(frame or sys._getframe(1), host=host, port=port)
+    client.attach(frame or sys._getframe(1), host=host, port=port)
 
 
 def docker_set_trace(*, host=None, port=None):
@@ -61,7 +60,7 @@ def docker_set_trace(*, host=None, port=None):
     at its own call site. If you need to control the frame — a wrapper, a signal
     handler, post-mortem — call :func:`set_trace` directly.)
     """
-    host = host or os.environ.get("DEBUG_HOST") or DOCKER_HOST
+    host = host or os.environ.get("DEBUG_HOST") or client.DOCKER_HOST
     set_trace(host=host, port=port, frame=sys._getframe(1))
 
 

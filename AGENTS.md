@@ -50,41 +50,67 @@ Guarantees callers rely on — **do not break these**:
 
 ```sh
 uv run reverse_ipdb-serve --keep          # fan-in: serve one container, detach, next…
-uv run reverse_ipdb-serve --keep --no-queue # don't queue: the others are told to continue
+uv run reverse_ipdb-serve --keep --no-queue [SECONDS]  # don't queue: the others continue
 python -m reverse_ipdb.serve --keep       # same, without uv
 socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
 ```
 
 `reverse_ipdb-serve` accepts every container immediately (none refused), shows a live
 roster (`queued:` / `attached:` / `detached:`), and puts your terminal in raw
-mode so completion works. With `--no-queue`, while one container
-holds the slot (queued or attached), every other arrival is answered `continue`
-(roster: `continued:`) and runs on as if no listener existed. Use a **raw**
-listener — `nc` mangles completion (line-buffered + local echo).
+mode so completion works. Use a **raw** listener — `nc` mangles completion
+(line-buffered + local echo).
+
+`--no-queue [SECONDS]`: while one container holds the slot (queued or
+attached), every other arrival is answered `continue` and runs on as if no
+listener existed. Two things keep a hot loop harmless:
+
+- **The listener stays silent while attached** — the terminal is in raw mode
+  and belongs to the remote shell then — and prints one digest on detach
+  (`continued ×N while attached: <host> pid=<pid> (<k> threads) ×n, …`).
+- **The turned-away thread cools down** for SECONDS (default 1) before it
+  dials again, tracked in a thread-local on the target so other threads are
+  unaffected.
 
 ## Wire protocol (keep stable across both sides)
 
-1. Target connects and sends one banner line:
-   `*** reverse_ipdb/pty <host> pid=<pid> thread=<name>\n`. The listener strips the
-   `reverse_ipdb/pty` tag and shows the rest as the session's identity.
+Each handshake message is **one JSON object per line** (`protocol.py`:
+`encode` / `decode` / `read_line`). **Every key is optional and unknown keys
+are ignored** on both sides, so either side can add fields without breaking
+the other — add keys, never repurpose or remove them.
+
+1. Target connects and sends its banner:
+   `{"reverse_ipdb": "pty", "host": "<host>", "pid": <pid>, "thread": "<name>"}`.
+   The listener shows `<host> pid=<pid> thread=<name>` (whichever it got) as
+   the session's identity.
 2. The listener replies **at once** (from its acceptor, not when it later
-   attaches) with one line: `"<cols> <rows>\n"` — the target sets the pty
-   winsize — or `"continue\n"` — the target hangs up, releases the shell lock
-   and runs on without importing IPython. The listener hanging up counts as
-   `continue`. No reply within `SIZE_TIMEOUT` (a plain socat listener) →
-   default 80×24.
+   attaches) with one of:
+   - `{"cols": <n>, "rows": <n>}` — attach; the target sets the pty winsize
+     (80×24 for whatever is missing);
+   - `{"continue": true, "cooldown": <seconds>}` — no shell: the target hangs
+     up, releases the shell lock and runs on without importing IPython, and
+     that thread doesn't dial again for `cooldown` seconds (0 if absent).
+   The listener hanging up counts as `continue`. No reply within
+   `client.REPLY_TIMEOUT` (a plain socat listener) → default size; a line that
+   isn't a JSON object → same.
 3. The stream is then a raw vt100 terminal both ways until the socket closes.
 
 ## Module map
 
 ```
 reverse_ipdb/
-  api.py         entry points (set_trace / set_trace_ipython); POSIX guard
-  client.py      dial() + shell lock + banner(); resolve_target()
-  pty_bridge.py  open pty, run TerminalPdb on it, pump <-> socket, teardown
-  debugger.py    ReverseIPdb (TerminalPdb) + DetachMixin
-  serve.py       fan-in listener: accept-all + roster + raw pty pass-through (--no-queue)
+  api.py         layer 1: entry points (set_trace / set_trace_ipython) -> client.attach
+  client.py      layer 2: attach() = dial() + handshake(); shell lock; cooldown -> pty_bridge.run
+  pty_bridge.py  layer 3: run(frame, sock, release, cols, rows): deferred debugger import,
+                 pty, pumps <-> socket, teardown
+  debugger.py    layer 3: ReverseIPdb (TerminalPdb) + DetachMixin
+  protocol.py    the wire, shared by both ends: JSON-object-per-line encode / decode / read_line
+  serve.py       the peer: fan-in listener, accept-all + roster + raw pass-through (--no-queue)
 ```
+
+Dependencies point **down only** (api → client → pty_bridge → debugger; serve
+and client share just `protocol`). `tests/test_layers.py` AST-scans every
+intra-package import, deferred ones included, and fails on any other edge —
+extend its `ALLOWED` table when adding a module, never by widening a layer.
 
 Completion mechanism, in one line: IPython's `TerminalPdb.cmdloop` rebinds its
 `IPCompleter` to the live frame before each prompt, and we run that prompt on a
@@ -135,20 +161,26 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   *after* TAB, proving the completer evaluated the live object; and the target
   must exit 0 after detach (no leaked prompt_toolkit threads). If you touch
   `pty_bridge.py` or the protocol, this is the test that matters.
+- `tests/test_protocol.py` — JSON-line encode/decode tolerance (missing and
+  unknown keys, non-objects) and `read_line` not over-reading into the session.
 - `tests/test_serve.py` — banner parsing, "many containers all queued, none
   refused" (each answered with the size line on arrival), and `--no-queue`
-  (one holds the slot, the rest get `continue`, slot frees on detach).
+  (one holds the slot, the rest get `continue` silently, one digest line on
+  detach, slot frees on detach).
 - `tests/test_handshake.py` — the target's side of the reply line: size /
   `continue` / hang-up / silence, and a `continue`d target resumes without
   importing IPython and can dial again.
-- `tests/test_api.py` — default routing to the pty bridge and aliasing.
-- `tests/test_client.py` — fail-open and shell-lock acquire/release via `dial()`.
+- `tests/test_api.py` — hand-off to `client.attach` and aliasing.
+- `tests/test_layers.py` — the import graph matches `docs/api-layers.md`.
+- `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,
+  and the per-thread `continue` cooldown.
 
 ## Gotchas
 
 - **"Completion doesn't work" is almost always a stale install or a non-raw
-  listener.** New build → banner shows `reverse_ipdb/pty` and the roster prints
-  `queued:`/`attached:`; old build → bannerless `reverse_ipdb/...` and `session from`.
+  listener.** New build → the banner is a JSON line with `"reverse_ipdb": "pty"`
+  and the roster prints `queued:`/`attached:`; old build → `*** reverse_ipdb/...`
+  text banners (which a new listener shows as a bare `ip:port`) or `session from`.
   Fix: `git pull && uv sync`. And use `reverse_ipdb-serve` (or `socat …,raw,echo=0`).
 - A completion **menu** (several candidates) stays open until dismissed; clear
   the line (Ctrl-U) before typing `detach`.

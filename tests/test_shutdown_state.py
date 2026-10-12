@@ -10,12 +10,15 @@ the flag first thing, then exercises the full session: banner, prompt, detach,
 program resumes and exits cleanly.
 """
 
+import json
 import re
 import socket
 import subprocess
 import sys
 import textwrap
 import time
+
+from reverse_ipdb import protocol
 
 TARGET = textwrap.dedent(
     """
@@ -64,16 +67,11 @@ def test_debugs_in_a_child_born_shutting_down():
         srv.settimeout(15)
         conn, _ = srv.accept()
 
-        banner = bytearray()
         conn.settimeout(10)
-        while not banner.endswith(b"\n"):
-            b = conn.recv(1)
-            if not b:
-                break
-            banner += b
-        assert banner.decode().startswith("*** reverse_ipdb/pty"), banner
+        banner = json.loads(protocol.read_line(conn))
+        assert banner["reverse_ipdb"] == "pty", banner
 
-        conn.sendall(b"80 24\n")
+        conn.sendall(protocol.encode({"cols": 80, "rows": 24}))
         # Reaching the prompt at all is the fix: without it the IPython import
         # dies with "can't register atexit after shutdown" before any prompt.
         assert _recv_until(conn, "ipdb>"), "never saw the ipdb> prompt"
