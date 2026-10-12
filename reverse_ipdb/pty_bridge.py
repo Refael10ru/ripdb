@@ -16,6 +16,7 @@ import contextlib
 import fcntl
 import functools
 import os
+import socket
 import struct
 import sys
 import termios
@@ -26,6 +27,7 @@ from reverse_ipdb import client
 
 DEFAULT_COLS, DEFAULT_ROWS = 80, 24
 SIZE_TIMEOUT = 0.5  # how long to wait for the listener's terminal size
+DRAIN_TIMEOUT = 1.0  # on close, how long the last output may take to reach the socket
 
 
 @contextlib.contextmanager
@@ -108,10 +110,21 @@ def _pump(src_read, dst_write, on_eof):
         on_eof()
 
 
-def _hangup(sock, release):
-    """Give the socket and the shell lock back; later breakpoints can dial again."""
+def _close_socket(sock):
+    """Hang up for real. ``close()`` alone is not enough: while another thread
+    is blocked in ``recv`` on it, Linux keeps the connection open — no FIN
+    goes out, so the listener never learns we left and keeps the session (and
+    everyone queued behind it) waiting. ``shutdown`` sends the FIN and wakes
+    that reader."""
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
     with contextlib.suppress(OSError):
         sock.close()
+
+
+def _hangup(sock, release):
+    """Give the socket and the shell lock back; later breakpoints can dial again."""
+    _close_socket(sock)
     release()
 
 
@@ -160,7 +173,7 @@ def run(frame, host=None, port=None):
             from prompt_toolkit.input.vt100 import Vt100Input  # noqa: PLC0415
             from prompt_toolkit.output.vt100 import Vt100_Output  # noqa: PLC0415
 
-            from reverse_ipdb.debugger import ReverseIPdb  # noqa: PLC0415
+            from reverse_ipdb import debugger  # noqa: PLC0415
     except Exception:
         # A broken debugger environment (e.g. mismatched IPython/pygments
         # files) must not take the program down: report it on both ends of
@@ -178,7 +191,7 @@ def run(frame, host=None, port=None):
     pt_in = Vt100Input(slave_in)
     pt_out = Vt100_Output.from_pty(slave_out)
 
-    dbg = ReverseIPdb(
+    dbg = debugger.ReverseIPdb(
         stdin=slave_in, stdout=slave_out,
         nosigint=True, readrc=False,
         pt_session_options={"input": pt_in, "output": pt_out},
@@ -198,23 +211,38 @@ def run(frame, host=None, port=None):
             closed = True
         with contextlib.suppress(Exception):
             dbg.thread_executor.shutdown(wait=False)  # TerminalPdb's prompt thread
-        for closer in (lambda: os.close(master_fd),
-                       slave_in.close, slave_out.close, sock.close):
+        # Slave side first: the pty->socket pump then drains whatever the
+        # debugger last wrote (a parting message) before it sees EOF.
+        for closer in (slave_in.close, slave_out.close):
             with contextlib.suppress(OSError):
                 closer()
+        if output_pump is not threading.current_thread():
+            output_pump.join(timeout=DRAIN_TIMEOUT)
+        with contextlib.suppress(OSError):
+            os.close(master_fd)
+        _close_socket(sock)  # wakes the socket->pty pump blocked in recv
         release()
 
-    dbg._reverse_ipdb_close = close
-
-    # Pump bytes both ways; either EOF tears the whole bridge down.
-    threading.Thread(
+    output_pump = threading.Thread(
         target=_pump, args=(lambda n: os.read(master_fd, n), sock.sendall, close),
         daemon=True,
-    ).start()
-    threading.Thread(
-        target=_pump, args=(sock.recv, lambda d: os.write(master_fd, d), close),
-        daemon=True,
-    ).start()
+    )
+    dbg._reverse_ipdb_close = close
+
+    def to_pty(data):
+        """Listener -> pty. A Ctrl-C byte while the prompt is not up would be
+        swallowed by the pty (it's nobody's controlling terminal, so no
+        SIGINT): hand it to the debugger, which interrupts the debugging
+        thread itself."""
+        os.write(master_fd, data)
+        for _ in range(data.count(b"\x03")):  # each press counts: two escalate
+            if dbg._reverse_ipdb_state != debugger.AT_PROMPT:
+                with contextlib.suppress(Exception):
+                    dbg.interrupt()
+
+    # Pump bytes both ways; either EOF tears the whole bridge down.
+    output_pump.start()
+    threading.Thread(target=_pump, args=(sock.recv, to_pty, close), daemon=True).start()
 
     try:
         dbg.set_trace(frame)

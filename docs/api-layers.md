@@ -76,9 +76,18 @@ The interactive behaviour, and the byte pipe that carries it.
   nor reads a stray `~/.pdbrc` from the container.
 - The **pty is the transport**: two pump threads shuttle bytes between the pty
   master and the socket. Either EOF tears the bridge down — a teardown hook
-  closes the pty, shuts down the prompt thread, closes the socket, and releases
-  the shell lock. A dead connection therefore never raises into the program.
-- `DetachMixin` — redefines `q` / `quit` / `exit` / EOF to **detach and
+  closes the pty, shuts down the prompt thread, **shuts down** and closes the
+  socket, and releases the shell lock. The `shutdown` matters: a bare
+  `close()` while the other pump is blocked in `recv` sends no FIN, and the
+  listener would never see the detach. A dead connection never raises into
+  the program.
+- `ReverseIPdb.interrupt()` — the socket->pty pump calls it for a Ctrl-C byte
+  whenever the prompt isn't up (no SIGINT exists for a pty that isn't the
+  controlling terminal): `KeyboardInterrupt` for a running command, a stop
+  at the next line for running code, `KeyboardInterrupt` on a second press.
+
+- `DetachMixin` — redefines `q` / `quit` / `exit` / EOF (and `c` when no
+  breakpoint is set) to **detach and
   continue** (via that teardown hook) instead of raising `BdbQuit` into the
   program.
 
@@ -97,7 +106,9 @@ live roster (`--keep` to advance into the next instead of exiting). With
 `--no-queue` the acceptor answers `continue` instead whenever another container
 already holds the slot, and that container runs on untouched. Each session is
 a raw-mode pass-through: it forwards bytes both ways via select (so
-completion and special keys work) and returns the instant the socket closes.
+completion and special keys work, Ctrl-C included) and returns the instant
+the socket closes — or when you press Ctrl-], the one local key, which drops
+the session so the next one in the queue comes up.
 One bad session is caught and never brings the listener down. It is documented
 alongside the layers because it speaks the same wire protocol, but it depends
 on none of the layers above and ships no shared code with them.

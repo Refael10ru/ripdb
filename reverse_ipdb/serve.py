@@ -14,6 +14,12 @@ Without ``--keep`` the listener serves the first container and exits. With
 next one waiting. With ``--no-queue`` nobody waits: while one container is
 attached, every other one that dials in is told to ``continue`` on the spot
 and runs on as if no listener existed.
+
+While attached, every key goes to the target — Ctrl-C included, which the
+target turns into an interrupt of whatever it is running. Ctrl-] is the one
+local key: it drops the attached session on the spot (the target detaches
+and runs on) so the next one in the queue comes up, even if the current
+target is stuck or gone.
 """
 
 import argparse
@@ -63,40 +69,66 @@ def _terminal_size():
     return 80, 24
 
 
+def _enable_keepalive(conn):
+    """Probe idle connections, so a container that vanished without a FIN
+    (killed, network gone) reads as a hang-up within about a minute and
+    stops holding the attached slot. Same cadence as the target side; kept
+    separate because the listener shares no code with the target stack."""
+    with contextlib.suppress(OSError):
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+        try:
+            option = getattr(socket, name)
+        except AttributeError:
+            continue  # not exposed on this platform: the OS default cadence then
+        with contextlib.suppress(OSError):
+            conn.setsockopt(socket.IPPROTO_TCP, option, value)
+
+
 def _reply(conn, line):
     """Answer a banner with one protocol line (``"cols rows"`` or ``"continue"``)."""
     with contextlib.suppress(OSError):
         conn.sendall(f"{line}\n".encode())
 
 
+DROP_KEY = b"\x1d"  # Ctrl-], telnet's escape: drop the attached session locally
+
+
 def _pump(conn):
     """Raw pass-through bridge: a transparent terminal between you and the target.
 
     Puts the local tty in raw mode and shuttles bytes both ways via select —
-    so keystrokes (TAB included) reach the target's prompt_toolkit and its
-    vt100 rendering comes straight back. Returns the instant the socket closes
-    (clean detach, no extra keypress). The terminal size was already sent by
-    the acceptor when the container was queued.
+    so keystrokes (TAB included, Ctrl-C included) reach the target's
+    prompt_toolkit and its vt100 rendering comes straight back. Returns the
+    instant the socket closes (clean detach, no extra keypress), or ``True``
+    when you pressed Ctrl-] to drop the session yourself — the one key that
+    never reaches the target. Whatever was typed before the attach (into the
+    roster, not the session) is discarded. The terminal size was already
+    sent by the acceptor when the container was queued.
     """
     fd = sys.stdin.fileno()
     saved = None
     with contextlib.suppress(OSError, termios.error):
         saved = termios.tcgetattr(fd)
         tty.setraw(fd)
+        termios.tcflush(fd, termios.TCIFLUSH)
     try:
         while True:
             readable, _, _ = select.select([fd, conn], [], [])
             if conn in readable:
                 data = conn.recv(65536)
                 if not data:
-                    break  # remote detached/closed
+                    return False  # remote detached/closed
                 os.write(sys.stdout.fileno(), data)
             if fd in readable:
                 data = os.read(fd, 65536)
                 if not data:
-                    break
+                    return False
+                data, dropped, _ = data.partition(DROP_KEY)
                 with contextlib.suppress(OSError):
                     conn.sendall(data)
+                if dropped:
+                    return True
     finally:
         if saved is not None:
             with contextlib.suppress(OSError, termios.error):
@@ -123,7 +155,8 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
         listener.bind((host, port))
         listener.listen(128)  # roomy backlog so a burst of containers isn't refused
         mode = ("no queue" if no_queue else "fan-in") + (", keep-alive" if keep else ", one-shot")
-        _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit")
+        _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit; "
+              "while attached, Ctrl-C interrupts the target and Ctrl-] drops it")
 
         def acceptor():
             while not stopping.is_set():
@@ -131,6 +164,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
                     conn, addr = listener.accept()
                 except OSError:
                     return  # listener closed -> we're shutting down
+                _enable_keepalive(conn)  # a vanished container must not hold the slot
                 ident = _read_banner(conn) or f"{addr[0]}:{addr[1]}"
                 if stopping.is_set():
                     conn.close()
@@ -154,11 +188,11 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
                 _note(f"attached: {ident}{suffix}")
                 try:
                     with conn:
-                        _pump(conn)
+                        dropped = _pump(conn)
                 except Exception as exc:  # one bad session must not kill the listener
                     _note(f"session error ({ident}): {exc!r}")
                 else:
-                    _note(f"detached: {ident}")
+                    _note(f"{'dropped' if dropped else 'detached'}: {ident}")
                 if no_queue:
                     slot.release()
                 if not keep:

@@ -1,7 +1,9 @@
 """Tests for the fan-in listener: banner parsing, no-container-refused, --no-queue."""
 
+import os
 import re
 import socket
+import sys
 import threading
 import time
 
@@ -163,3 +165,43 @@ def test_no_queue_flag_is_wired(monkeypatch):
                             keep=keep, no_queue=no_queue))
     serve_mod.main(["--no-queue", "--keep"])
     assert captured == {"keep": True, "no_queue": True}
+
+
+def test_ctrl_bracket_drops_the_attached_session(monkeypatch):
+    """Ctrl-] never reaches the target: the listener closes that session itself
+    and moves on to the next one queued — the way out of a stuck target."""
+    port = _free_port()
+    notes = []
+    monkeypatch.setattr(serve_mod, "_note", lambda msg: notes.append(msg))
+    stdin_r, stdin_w = os.pipe()
+    stdout_r, stdout_w = os.pipe()
+    monkeypatch.setattr(sys, "stdin", os.fdopen(stdin_r, "rb", buffering=0))
+    monkeypatch.setattr(sys, "stdout", os.fdopen(stdout_w, "wb", buffering=0))
+    t = threading.Thread(target=serve_mod.serve, args=("127.0.0.1", port, True), daemon=True)
+    t.start()
+    conns = []
+    try:
+        assert _wait(lambda: any("listening" in m for m in notes))
+
+        def dial(name):
+            c = socket.create_connection(("127.0.0.1", port), timeout=5)
+            c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
+            assert SIZE_LINE.match(_recv_line(c))
+            conns.append(c)
+            return c
+
+        first, second = dial("first"), dial("second")
+        assert _wait(lambda: any("attached: first" in m for m in notes))
+        os.write(stdin_w, b"x" + serve_mod.DROP_KEY + b"ignored")
+        first.settimeout(5)
+        assert first.recv(1) == b"x"       # typed before Ctrl-] still went through
+        assert first.recv(1) == b""        # then the listener hung up on it
+        assert _wait(lambda: any("dropped: first" in m for m in notes)), notes
+        assert _wait(lambda: any("attached: second" in m for m in notes)), notes
+        second.sendall(b"hello")
+        assert os.read(stdout_r, 5) == b"hello"
+    finally:
+        for c in conns:
+            c.close()
+        os.close(stdin_w)
+        os.close(stdout_r)

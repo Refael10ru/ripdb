@@ -6,6 +6,7 @@ is unreachable within the timeout), ``dial`` returns ``None`` and the caller
 treats the breakpoint as a no-op.
 """
 
+import contextlib
 import os
 import socket
 import threading
@@ -22,6 +23,21 @@ CONNECT_TIMEOUT = 1.0
 # Only one thread/process gets the interactive shell at a time; others pass
 # through. The lock is held for the whole session and released when it ends.
 _shell_lock = threading.Lock()
+
+
+def enable_keepalive(sock):
+    """Probe an idle connection so a peer that vanished (container killed,
+    network gone) reads as a hang-up within about a minute instead of never.
+    """
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+        try:
+            option = getattr(socket, name)
+        except AttributeError:
+            continue  # not exposed on this platform: the OS default cadence then
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, option, value)
 
 
 def resolve_target(host=None, port=None):
@@ -68,6 +84,7 @@ def dial(host=None, port=None):
             release()
             return None  # nobody listening -> keep running
         sock.settimeout(None)
+        enable_keepalive(sock)
         return sock, release
     except BaseException:
         release()
