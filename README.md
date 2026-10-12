@@ -125,7 +125,7 @@ on the spot and runs on untouched, exactly as if no listener were running:
 *** reverse_ipdb listening on 0.0.0.0:4444 (single, keep-alive) — Ctrl-C to quit
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread
-*** continued: worker-3a1 pid=9 thread=Thread-2  (busy with web-7f9c pid=12 thread=MainThread)
+*** continued: worker-3a1 pid=9 thread=Thread-2
    … `detach` frees the slot; the next container to arrive gets a shell …
 ```
 

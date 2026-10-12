@@ -116,7 +116,6 @@ def serve(host="0.0.0.0", port=4444, keep=False, single=False):
     sessions = queue.Queue()
     stopping = threading.Event()
     slot = threading.Lock()   # --single: held from queueing until detach
-    current = [""]            # identity of the container holding the slot
     cols, rows = _terminal_size()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -139,10 +138,8 @@ def serve(host="0.0.0.0", port=4444, keep=False, single=False):
                 if single and not slot.acquire(blocking=False):
                     _reply(conn, "continue")
                     conn.close()
-                    _note(f"continued: {ident}  (busy with {current[0]})")
+                    _note(f"continued: {ident}")
                     continue
-                if single:
-                    current[0] = ident
                 _reply(conn, f"{cols} {rows}")
                 sessions.put((conn, ident))
                 _note(f"queued: {ident}  ({sessions.qsize()} waiting)")

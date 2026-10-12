@@ -20,7 +20,7 @@ def _pair():
 def test_reply_size_line():
     a, b = _pair()
     a.sendall(b"132 43\n")
-    assert pty_bridge._read_reply(b) == (132, 43)
+    assert pty_bridge._handshake(b) == (132, 43)
     a.close()
     b.close()
 
@@ -28,15 +28,15 @@ def test_reply_size_line():
 def test_reply_continue_means_no_shell():
     a, b = _pair()
     a.sendall(b"continue\n")
-    assert pty_bridge._read_reply(b) is None
+    assert pty_bridge._handshake(b) is None
     a.close()
     b.close()
 
 
-def test_reply_hangup_before_any_byte_means_no_shell():
+def test_reply_hangup_means_no_shell():
     a, b = _pair()
     a.close()
-    assert pty_bridge._read_reply(b) is None
+    assert pty_bridge._handshake(b) is None
     b.close()
 
 
@@ -44,7 +44,7 @@ def test_reply_silence_falls_back_to_default_size(monkeypatch):
     # A plain socat/nc listener never replies: default size after the timeout.
     monkeypatch.setattr(pty_bridge, "SIZE_TIMEOUT", 0.05)
     a, b = _pair()
-    assert pty_bridge._read_reply(b) == (pty_bridge.DEFAULT_COLS, pty_bridge.DEFAULT_ROWS)
+    assert pty_bridge._handshake(b) == (pty_bridge.DEFAULT_COLS, pty_bridge.DEFAULT_ROWS)
     a.close()
     b.close()
 

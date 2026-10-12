@@ -140,8 +140,7 @@ def test_single_mode_continues_everyone_while_busy():
         second = dial("second")
         assert _recv_line(second) == b"continue\n"            # told to run on
         assert second.recv(1) == b""                           # and hung up
-        assert _wait(lambda: any("continued: second" in m and "busy with first" in m
-                                 for m in notes)), notes
+        assert _wait(lambda: any("continued: second" in m for m in notes)), notes
         assert not any("queued: second" in m for m in notes)
 
         first.close()                                          # detach

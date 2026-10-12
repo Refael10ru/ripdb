@@ -64,30 +64,31 @@ def _set_winsize(fd, cols, rows):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def _read_reply(sock):
-    """Read the listener's one-line reply to our banner.
+def _handshake(sock):
+    """Send our banner and read the listener's one-line reply.
 
-    ``"cols rows\\n"`` -> that terminal size. ``"continue\\n"`` (or the
-    listener hanging up before replying) -> ``None``: no shell for us, run on.
-    A plain socat/nc listener never replies, so after ``SIZE_TIMEOUT`` we fall
-    back to a default size.
+    ``"cols rows\\n"`` -> that terminal size. ``"continue\\n"``, or the listener
+    hanging up -> ``None``: no shell for us, run on. A plain socat/nc listener
+    never replies, so after ``SIZE_TIMEOUT`` we fall back to a default size.
     """
     sock.settimeout(SIZE_TIMEOUT)
     buf = bytearray()
-    closed = False
-    with contextlib.suppress(OSError):
+    try:
+        sock.sendall(client.banner().encode("utf-8"))
         while not buf.endswith(b"\n") and len(buf) < 32:
             chunk = sock.recv(1)
             if not chunk:
-                closed = True
-                break
+                return None  # listener hung up
             buf += chunk
+    except TimeoutError:
+        pass  # a plain socat/nc listener never replies
+    except OSError:
+        return None  # listener gone
     sock.settimeout(None)
-    line = buf.strip()
-    if line == b"continue" or (closed and not line):
+    if buf.strip() == b"continue":
         return None
     try:
-        cols, rows = (int(x) for x in line.split())
+        cols, rows = (int(x) for x in buf.split())
         return cols, rows
     except ValueError:
         return DEFAULT_COLS, DEFAULT_ROWS
@@ -139,15 +140,10 @@ def run(frame, host=None, port=None):
         return
     sock, release = dialed
 
-    # Handshake first: banner out, one reply line back. A listener that answers
-    # "continue" (reverse_ipdb-serve --single while it's busy) gets no shell
-    # from us — hang up and run on, without ever importing the debugger.
-    try:
-        sock.sendall(client.banner().encode("utf-8"))
-    except OSError:
-        _hangup(sock, release)
-        return
-    size = _read_reply(sock)
+    # Banner out, one reply line back. A listener that answers "continue"
+    # (reverse_ipdb-serve --single while it's busy) gets no shell from us:
+    # hang up and run on, without ever importing the debugger.
+    size = _handshake(sock)
     if size is None:
         _hangup(sock, release)
         return

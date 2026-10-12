@@ -70,8 +70,8 @@ listener — `nc` mangles completion (line-buffered + local echo).
 2. The listener replies **at once** (from its acceptor, not when it later
    attaches) with one line: `"<cols> <rows>\n"` — the target sets the pty
    winsize — or `"continue\n"` — the target hangs up, releases the shell lock
-   and runs on without importing IPython. Hanging up before any reply counts
-   as `continue`. No reply within `SIZE_TIMEOUT` (a plain socat listener) →
+   and runs on without importing IPython. The listener hanging up counts as
+   `continue`. No reply within `SIZE_TIMEOUT` (a plain socat listener) →
    default 80×24.
 3. The stream is then a raw vt100 terminal both ways until the socket closes.
 
