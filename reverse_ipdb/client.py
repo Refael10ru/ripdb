@@ -46,6 +46,21 @@ def cool_down(seconds):
     _local.skip_until = time.monotonic() + seconds
 
 
+def enable_keepalive(sock):
+    """Probe an idle connection so a peer that vanished (container killed,
+    network gone) reads as a hang-up within about a minute instead of never.
+    """
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+        try:
+            option = getattr(socket, name)
+        except AttributeError:
+            continue  # not exposed on this platform: the OS default cadence then
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, option, value)
+
+
 def resolve_target(host=None, port=None):
     """Resolve the (host, port) to dial, applying env vars and defaults."""
     host = host or os.environ.get("DEBUG_HOST", DEFAULT_HOST)
@@ -73,7 +88,8 @@ def dial(host=None, port=None):
     Returns ``(sock, release)`` or ``None``. ``None`` means nobody is listening
     (fail-open), another thread already holds the shell, or this thread is
     still cooling down after a ``continue``. ``release`` closes the socket and
-    frees the lock, idempotently; whoever ends the session calls it.
+    frees the lock, idempotently; whoever ends the session calls it. It hangs
+    up for real (``shutdown`` first) even while a pump is blocked reading.
     """
     if time.monotonic() < _local.skip_until:
         return None  # recently told to continue -> cheap no-op, no connection
@@ -90,12 +106,19 @@ def dial(host=None, port=None):
         _shell_lock.release()
         raise
     sock.settimeout(None)
+    enable_keepalive(sock)
     released = False
 
     def release():
         nonlocal released
         if not released:
             released = True
+            # shutdown, not just close: while another thread is blocked in
+            # recv on this socket, Linux sends no FIN on close() — the
+            # listener would never learn we left, and keep the session (and
+            # everyone queued behind it) waiting.
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
             with contextlib.suppress(OSError):
                 sock.close()
             _shell_lock.release()

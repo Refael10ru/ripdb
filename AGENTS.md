@@ -42,7 +42,34 @@ Guarantees callers rely on — **do not break these**:
   the session's socket/pty closes.
 - **Detach, don't kill.** `q` / `quit` / `exit` / EOF / `detach` remove
   breakpoints, tear down the connection, and `continue` — they never raise
-  `BdbQuit` into the program.
+  `BdbQuit` into the program. `c` with no breakpoints set detaches too
+  (nothing could bring the prompt back, so holding the listener would only
+  stall the queue).
+- **Hang up for real.** Teardown `shutdown()`s the socket before closing it:
+  a bare `close()` while the socket->pty pump is blocked in `recv` sends no
+  FIN on Linux, so a target that keeps running after detach left the
+  listener (and everything queued behind it) stuck. The `release()` that
+  `client.dial` returns owns this;
+  `tests/test_session.py` pins it.
+- **A listener hang-up releases the target.** Closing fds under a blocked
+  prompt never wakes it, so when the socket dies the bridge calls
+  `ReverseIPdb.hang_up()`: it ends the running prompt with `EOFError` (via the
+  prompt's own event loop) or, if none is up, the next one as soon as it
+  starts — the debugger takes that as `detach`. Until then the pty->socket
+  pump keeps reading and discarding, so the debugger's writes (a command's
+  output, the stack at the next breakpoint) neither block nor fail into the
+  program. Only the output pump closes the master, once the slave is closed.
+- **Ctrl-C without signals, never into the program.** The pty is nobody's
+  controlling terminal, so a `\x03` from the listener raises no SIGINT; the
+  socket->pty pump hands it to `ReverseIPdb.interrupt()`. At the prompt it
+  passes on (prompt_toolkit clears the line). During a command that evaluates
+  code — `default` (`!x`, bare statements), `p`, `pp`, marked with
+  `_evaluates_code` — it raises `KeyboardInterrupt` in the debugging thread
+  (real SIGINT for a main thread with Python's default handler, else an async
+  exception); those commands never resume the program, so it can only land in
+  them or in pdb's prompt loop, which catches it. While the program runs it
+  only calls `set_step()`. Other debugger commands ignore it. Never install a
+  SIGINT handler in the target, and never raise into the program's own code.
 - **POSIX only.** A pty is required, so the package imports `termios` at the
   top level — `import reverse_ipdb` only works on a Unix platform.
 
@@ -71,6 +98,22 @@ listener existed. Two things keep a hot loop harmless:
   dials again, tracked in a thread-local on the target so other threads are
   unaffected.
 
+The listener must **never become unresponsive**:
+
+- **Ctrl-] is the listener's.** Raw mode keeps `ISIG` on with `VINTR` set to
+  Ctrl-] (and `VQUIT` / `VSUSP` disabled), so Ctrl-] is a SIGINT here — it
+  breaks the listener out of anything — and never reaches the target. While
+  attached it drops the session (`dropped:`); a second one within
+  `QUIT_WINDOW` quits. Ctrl-C at the idle roster quits as usual. Every other
+  key, Ctrl-C included, goes to the target.
+- **No socket can block it.** Banners are read by one short-lived thread per
+  connection, bounded by `BANNER_TIMEOUT` (silent clients: `ignored:`), and
+  keystrokes are sent with `SEND_TIMEOUT` (a target not reading is dropped).
+- **Nothing is left paused.** Every accepted connection is tracked until
+  released; on drop, stall or exit each one is hung up (`shutdown` + `close`),
+  and `accept()` is woken with `listener.shutdown()` — `close()` alone
+  doesn't wake it on Linux.
+
 ## Wire protocol (keep stable across both sides)
 
 Each handshake message is **one JSON object per line** (`protocol.py`:
@@ -93,6 +136,8 @@ the other — add keys, never repurpose or remove them.
    `client.REPLY_TIMEOUT` (a plain socat listener) → default size; a line that
    isn't a JSON object → same.
 3. The stream is then a raw vt100 terminal both ways until the socket closes.
+   Both ends turn on TCP keepalive (same cadence on each side), so a peer
+   that vanishes without a FIN reads as a hang-up within about a minute.
 
 ## Module map
 
@@ -164,12 +209,22 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
 - `tests/test_protocol.py` — JSON-line encode/decode tolerance (missing and
   unknown keys, non-objects) and `read_line` not over-reading into the session.
 - `tests/test_serve.py` — banner parsing, "many containers all queued, none
-  refused" (each answered with the size line on arrival), and `--no-queue`
+  refused" (each answered with the size line on arrival), `--no-queue`
   (one holds the slot, the rest get `continue` silently, one digest line on
-  detach, slot frees on detach).
+  detach, slot frees on detach), Ctrl-] dropping the attached session, a
+  silent client holding up nobody, a target not reading input being dropped,
+  exit releasing everyone still waiting, and — under a real pty — Ctrl-C
+  passed to the target, Ctrl-] dropping, a second Ctrl-] quitting with the
+  terminal restored, and Ctrl-C quitting the idle roster.
 - `tests/test_handshake.py` — the target's side of the reply line: size /
   `continue` / hang-up / silence, and a `continue`d target resumes without
   importing IPython and can dial again.
+- `tests/test_session.py` — session lifecycle against a real target: detach
+  hangs up **while the program keeps running** (the queue-stall regression),
+  `c` without breakpoints detaches, and a **listener** hang-up releases the
+  target — at its prompt, mid-command (output still flowing) and between
+  breakpoints; and Ctrl-C interrupting a command (main and worker thread, with
+  the "pending" note for a blocking call) or stopping the running program.
 - `tests/test_api.py` — hand-off to `client.attach` and aliasing.
 - `tests/test_layers.py` — the import graph matches `docs/api-layers.md`.
 - `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,
@@ -185,5 +240,11 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
 - A completion **menu** (several candidates) stays open until dismissed; clear
   the line (Ctrl-U) before typing `detach`.
 - Mid-session terminal **resize** isn't propagated — size is sent once at attach.
+- Ctrl-C in a **worker thread** is an async exception: it can't break a
+  blocking C call (`time.sleep`, `recv`), only land after it returns. The shell
+  prints "KeyboardInterrupt pending" when that happens; Ctrl-] is the way out.
+- Ctrl-C while the program runs stops at the next line **it traces**. After
+  `c` with breakpoints, frames without breakpoints may not be traced, so it can
+  take until the current call returns. It never escalates into the program.
 - IPython is a hard dependency (it brings prompt_toolkit); runtime deps = just
   IPython, everything else stdlib.

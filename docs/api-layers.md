@@ -96,10 +96,23 @@ The interactive behaviour, and the byte pipe that carries it.
   `readrc=False` so the debugger neither hijacks the program's Ctrl-C handler
   nor reads a stray `~/.pdbrc` from the container.
 - The **pty is the transport**: two pump threads shuttle bytes between the pty
-  master and the socket. Either EOF tears the bridge down — a teardown hook
-  closes the pty, shuts down the prompt thread, closes the socket, and releases
-  the shell lock. A dead connection therefore never raises into the program.
-- `DetachMixin` — redefines `q` / `quit` / `exit` / EOF to **detach and
+  master and the socket. Either side ending tears the bridge down. A detach
+  closes the pty slave (the output pump drains the parting message, then
+  closes the master), then calls Layer 2's `release`, which **shuts down** and
+  closes the socket and frees the shell lock. The `shutdown` matters: a bare `close()` while the other pump is
+  blocked in `recv` sends no FIN, and the listener would never see the detach.
+- A **listener hang-up** calls `ReverseIPdb.hang_up()`, which ends the prompt
+  (now, or the next one to start) as if Ctrl-D were pressed, so the target
+  detaches and runs on instead of staying paused. Until it does, the output
+  pump discards whatever the debugger writes, so a dead connection never
+  blocks or raises into the program.
+- `ReverseIPdb.interrupt()` — the socket->pty pump hands it each Ctrl-C byte
+  (no SIGINT exists for a pty that isn't the controlling terminal). During a
+  command that evaluates code it raises `KeyboardInterrupt` in that command;
+  while the program runs it stops at the next line; at the prompt the byte
+  passes on and clears the line. It never raises into the program's own code.
+- `DetachMixin` — redefines `q` / `quit` / `exit` / EOF (and `c` when no
+  breakpoint is set) to **detach and
   continue** (via that teardown hook) instead of raising `BdbQuit` into the
   program.
 
@@ -132,20 +145,26 @@ After the reply the socket is a raw vt100 terminal until it closes.
 
 Not part of the target-side stack; it runs on **your** machine as the other
 end of the socket (`python -m reverse_ipdb.serve`, or a plain `socat`/`nc`). A
-background acceptor thread fans in **every** connecting container at once —
-reading each one's banner, answering it *at once* with the terminal size and
-queueing it so none is refused — while the foreground serves them one at a
-time with a live roster (`--keep` to advance into the next instead of exiting).
-With `--no-queue [SECONDS]` the acceptor instead answers `continue` plus that
-cooldown (default 1s) whenever another container already holds the slot, and
-that container runs on untouched; the listener stays silent while a session
-is attached (the terminal belongs to the remote shell then) and reports the
-turned-away containers in one digest line on detach, grouped by process with
-a thread count. Each session is a raw-mode pass-through: it forwards bytes
-both ways via select (so completion and special keys work) and returns the
-instant the socket closes. One bad session is caught and never brings the
-listener down. It depends on none of the layers above; `protocol.py` is the
-only code it shares with them.
+background acceptor fans in **every** connecting container at once, handing
+each to a short-lived handshake thread that reads its banner (with a timeout,
+so a silent client holds up nobody), answers it *at once* with the terminal
+size and queues it so none is refused — while the foreground serves them one
+at a time with a live roster (`--keep` to advance into the next instead of
+exiting). With `--no-queue [SECONDS]` the handshake instead answers `continue`
+plus that cooldown (default 1s) whenever another container already holds the
+slot, and that container runs on untouched; the listener stays silent while a
+session is attached (the terminal belongs to the remote shell then) and
+reports the turned-away containers in one digest line on detach, grouped by
+process with a thread count. Each session is a raw-mode pass-through: it
+forwards bytes both ways via select (so completion and special keys work) and
+returns the instant the socket closes. Ctrl-] is the one key kept for the
+listener, as its terminal interrupt key: it drops the session, and a second
+one right after quits. Ctrl-C goes to the target like any other key. A target
+that stops reading input is dropped after a timeout. Every container held is
+released (hung up, so it runs on) when its session ends and when the listener
+exits. One bad session is caught and never brings the listener down. It
+depends on none of the layers above; `protocol.py` is the only code it shares
+with them.
 
 ## Why these boundaries
 

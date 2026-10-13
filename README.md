@@ -106,7 +106,7 @@ none is ever refused — and each stays paused at its `set_trace` until it's
 your turn. You get a live roster and walk them one at a time:
 
 ```
-*** reverse_ipdb listening on 0.0.0.0:4444 (fan-in, keep-alive) — Ctrl-C to quit
+*** reverse_ipdb listening on 0.0.0.0:4444 (fan-in, keep-alive) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** queued: worker-3a1 pid=9 thread=Thread-2    (2 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread  (1 still waiting)
@@ -114,6 +114,23 @@ your turn. You get a live roster and walk them one at a time:
 *** detached: web-7f9c pid=12 thread=MainThread
 *** attached: worker-3a1 pid=9 thread=Thread-2
 ```
+
+A session ends with `detach` (or `q`, Ctrl-D, or `c` with no breakpoints set).
+
+While attached, **Ctrl-] is the listener's key** and every other key goes to
+the target, Ctrl-C included:
+
+- **Ctrl-]** drops the session (roster: `dropped:`). The target detaches and
+  runs on, finishing any command it was in the middle of, and the next one
+  waiting comes up. It works even when the target is stuck: the terminal turns
+  it into a signal for the listener, which nothing can block.
+- **A second Ctrl-] right after** (within a second), or **Ctrl-C at the idle
+  roster**, quits the listener. Every container still waiting on it is released
+  and runs on, and your terminal is restored.
+
+The listener also never waits on a single container: one that connects without
+a banner is hung up after 5 s (`ignored:`), and one that stops taking your
+keystrokes for 5 s is dropped (`dropped (not reading input …)`).
 
 You never connect *to* the containers — they come to you. (This is exactly
 what forward debuggers like madbg can't do: there you'd chase N endpoints.)
@@ -124,7 +141,7 @@ on the spot and runs on untouched, exactly as if no listener were running
 (`--no-queue 5` also tells it to stay away for 5 seconds; the default is 1):
 
 ```
-*** reverse_ipdb listening on 0.0.0.0:4444 (no queue, 1s cooldown, keep-alive) — Ctrl-C to quit
+*** reverse_ipdb listening on 0.0.0.0:4444 (no queue, 1s cooldown, keep-alive) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread
    … debug web-7f9c; meanwhile other breakpoints just continue, silently …
@@ -153,7 +170,16 @@ your program.**
 | Command             | Effect                                             |
 |---------------------|----------------------------------------------------|
 | `detach` / `q` / Ctrl-D | remove breakpoints, close the socket, **let the program continue** |
-| `c` (continue)      | resume; the trace stays armed for later breakpoints |
+| `c` (continue)      | resume; the session stays open for your breakpoints. With **no** breakpoints set it detaches, since nothing could bring the prompt back |
+| Ctrl-C              | at the prompt: clear the line. During a command that runs code (`!time.sleep(60)`, `p slow()`): interrupt it, back to the prompt. While the program runs (after `n`, `c`...): stop at the next line it runs. It never raises into the program itself |
+| Ctrl-]              | handled by the listener: drop this session (the target detaches and runs on); see above |
+
+Ctrl-C reaches the target as a keystroke, not as a signal to the process, so
+the program's own SIGINT handler is never involved. Outside the main thread,
+Python can only interrupt between bytecodes: a pure-Python loop stops at once,
+but a blocking call (`time.sleep`, a socket read) is interrupted only when it
+returns. The shell says so when that happens, and Ctrl-] still drops the
+session meanwhile.
 
 This is deliberate: a stray `q` over a flaky debugging link should never raise
 `BdbQuit` into production code.
@@ -169,6 +195,13 @@ This is deliberate: a stray `q` over a flaky debugging link should never raise
 - **No surprises in the target.** It doesn't hijack the program's Ctrl-C handler
   (`nosigint`) and doesn't read a stray `~/.pdbrc` from inside the container
   (`readrc=False`).
+- **Leaving is immediate, from either end.** The moment you detach, the target
+  hangs up (a `shutdown`, not just a `close`, so the listener sees it even while
+  the program keeps running) and the next queued container comes up. When the
+  listener hangs up instead (a drop, or quitting), the target leaves its prompt
+  as if you'd typed Ctrl-D and runs on; it never stays paused for a listener
+  that's gone. TCP keepalive on both ends means a container that vanishes
+  outright frees its place within about a minute.
 - **Completion over the wire.** The IPython debugger runs on a pty so
   prompt_toolkit engages; completion is computed on the target against the
   live frame and rendered to your terminal. POSIX targets only — elsewhere
