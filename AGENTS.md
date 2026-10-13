@@ -76,27 +76,32 @@ Guarantees callers rely on — **do not break these**:
 ## Listener (your machine)
 
 ```sh
-uv run reverse_ipdb-serve --keep          # fan-in: serve one container, detach, next…
-uv run reverse_ipdb-serve --keep --no-queue [SECONDS]  # don't queue: the others continue
+uv run reverse_ipdb-serve --keep          # one shell at a time, the others continue (default)
+uv run reverse_ipdb-serve --keep --cooldown 5  # …and stay away 5s before dialing again (default 1)
+uv run reverse_ipdb-serve --keep --queue  # queue: everyone waits, walk them in arrival order
 python -m reverse_ipdb.serve --keep       # same, without uv
 socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
 ```
 
-`reverse_ipdb-serve` accepts every container immediately (none refused), shows a live
-roster (`queued:` / `attached:` / `detached:`), and puts your terminal in raw
-mode so completion works. Use a **raw** listener — `nc` mangles completion
+`reverse_ipdb-serve` accepts every container immediately, shows a live roster
+(`queued:` / `attached:` / `detached:`), and puts your terminal in raw mode so
+completion works. Use a **raw** listener — `nc` mangles completion
 (line-buffered + local echo).
 
-`--no-queue [SECONDS]`: while one container holds the slot (queued or
-attached), every other arrival is answered `continue` and runs on as if no
-listener existed. Two things keep a hot loop harmless:
+**Default — no queue.** While one container holds the slot (about to attach,
+or attached), every other arrival is answered `continue` and runs on as if no
+listener existed (`serve(cooldown=1.0)`). Two things keep a hot loop harmless:
 
 - **The listener stays silent while attached** — the terminal is in raw mode
   and belongs to the remote shell then — and prints one digest on detach
   (`continued ×N while attached: <host> pid=<pid> (<k> threads) ×n, …`).
-- **The turned-away thread cools down** for SECONDS (default 1) before it
-  dials again, tracked in a thread-local on the target so other threads are
-  unaffected.
+- **The turned-away thread cools down** for `--cooldown` seconds (default 1)
+  before it dials again, tracked in a thread-local on the target so other
+  threads are unaffected.
+
+**`--queue`** (`serve(cooldown=None)`): every arrival is answered with the
+terminal size and queued, none refused; each stays paused at its breakpoint
+until you reach it. `--queue` and `--cooldown` are mutually exclusive.
 
 The listener must **never become unresponsive**:
 
@@ -149,7 +154,7 @@ reverse_ipdb/
                  pty, pumps <-> socket, teardown
   debugger.py    layer 3: ReverseIPdb (TerminalPdb) + DetachMixin
   protocol.py    the wire, shared by both ends: JSON-object-per-line encode / decode / read_line
-  serve.py       the peer: fan-in listener, accept-all + roster + raw pass-through (--no-queue)
+  serve.py       the peer: the listener, roster + raw pass-through (default no queue, --queue)
 ```
 
 Dependencies point **down only** (api → client → pty_bridge → debugger; serve
@@ -208,10 +213,11 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   `pty_bridge.py` or the protocol, this is the test that matters.
 - `tests/test_protocol.py` — JSON-line encode/decode tolerance (missing and
   unknown keys, non-objects) and `read_line` not over-reading into the session.
-- `tests/test_serve.py` — banner parsing, "many containers all queued, none
-  refused" (each answered with the size line on arrival), `--no-queue`
-  (one holds the slot, the rest get `continue` silently, one digest line on
-  detach, slot frees on detach), Ctrl-] dropping the attached session, a
+- `tests/test_serve.py` — banner parsing, `--queue`: "many containers all
+  queued, none refused" (each answered with the size line on arrival), the
+  default no-queue mode (one holds the slot, the rest get `continue` silently,
+  one digest line on detach, slot frees on detach), the mode flags
+  (`--cooldown`, `--queue`, the two exclusive), Ctrl-] dropping the attached session, a
   silent client holding up nobody, a target not reading input being dropped,
   exit releasing everyone still waiting, and — under a real pty — Ctrl-C
   passed to the target, Ctrl-] dropping, a second Ctrl-] quitting with the

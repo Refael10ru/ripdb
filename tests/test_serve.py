@@ -1,4 +1,5 @@
-"""Tests for the fan-in listener: banner parsing, no-container-refused, --no-queue,
+"""Tests for the listener: banner parsing, --queue (no container refused), the default
+no-queue mode with its cooldown,
 Ctrl-] and Ctrl-C on a real terminal, and never blocking or leaving anyone paused."""
 
 import collections
@@ -89,7 +90,8 @@ def test_simultaneous_containers_are_all_queued_none_refused():
 
     # Run serve in keep mode in a background thread; we never drive a session,
     # we only assert the acceptor queues everyone.
-    t = threading.Thread(target=serve_mod.serve, args=("127.0.0.1", port, True), daemon=True)
+    t = threading.Thread(target=serve_mod.serve, args=("127.0.0.1", port, True, None),
+                         daemon=True)                         # None: --queue
     t.start()
     try:
         # Wait for the listener to be up.
@@ -127,7 +129,7 @@ def test_simultaneous_containers_are_all_queued_none_refused():
 
 
 def test_no_queue_continues_everyone_while_busy():
-    """--no-queue: one container holds the slot; the rest are told to continue
+    """The default mode: one container holds the slot; the rest are told to continue
     (reported as one digest line on detach), and the slot frees up on detach."""
     port = _free_port()
     notes = []
@@ -182,17 +184,23 @@ def test_no_queue_continues_everyone_while_busy():
         serve_mod._note, serve_mod._pump = original_note, original_pump
 
 
-def test_no_queue_flag_is_wired(monkeypatch):
+def test_mode_flags_are_wired(monkeypatch):
+    """No queue is the default (1s cooldown); --cooldown sets it; --queue
+    switches to queueing, and the two don't mix."""
     captured = {}
     monkeypatch.setattr(serve_mod, "serve",
-                        lambda host, port, keep, no_queue: captured.update(
-                            keep=keep, no_queue=no_queue))
-    serve_mod.main(["--no-queue", "--keep"])
-    assert captured == {"keep": True, "no_queue": 1.0}      # default cooldown
-    serve_mod.main(["--no-queue", "0.5"])
-    assert captured == {"keep": False, "no_queue": 0.5}
+                        lambda host, port, keep, cooldown: captured.update(
+                            keep=keep, cooldown=cooldown))
     serve_mod.main([])
-    assert captured == {"keep": False, "no_queue": None}    # fan-in
+    assert captured == {"keep": False, "cooldown": 1.0}      # the default: no queue
+    serve_mod.main(["--cooldown", "0.5", "--keep"])
+    assert captured == {"keep": True, "cooldown": 0.5}
+    serve_mod.main(["--queue", "--keep"])
+    assert captured == {"keep": True, "cooldown": None}      # queue
+    with pytest.raises(SystemExit):
+        serve_mod.main(["--queue", "--cooldown", "1"])         # a cooldown only applies without one
+    with pytest.raises(SystemExit):
+        serve_mod.main(["--no-queue"])                         # gone: it's the default now
 
 
 def test_continued_digest_groups_by_container(capsys):
@@ -241,7 +249,7 @@ def test_ctrl_bracket_drops_the_attached_session(monkeypatch):
 class _Listener:
     """``serve()`` in a thread, with pipes standing in for the terminal."""
 
-    def __init__(self, monkeypatch, keep=True):
+    def __init__(self, monkeypatch, keep=True, cooldown=None):   # None: --queue
         self.port = _free_port()
         self.notes = []
         monkeypatch.setattr(serve_mod, "_note", self.notes.append)
@@ -252,7 +260,8 @@ class _Listener:
         monkeypatch.setattr(sys, "stdin", self.stdin)
         monkeypatch.setattr(sys, "stdout", self.stdout)
         self.thread = threading.Thread(target=serve_mod.serve,
-                                       args=("127.0.0.1", self.port, keep), daemon=True)
+                                       args=("127.0.0.1", self.port, keep, cooldown),
+                                       daemon=True)
         self.thread.start()
         self.conns = []
         assert _wait(lambda: any("listening" in m for m in self.notes))
@@ -394,7 +403,7 @@ def test_exit_releases_every_waiting_container(monkeypatch):
 LISTENER_UNDER_PTY = """
 import sys
 from reverse_ipdb import serve
-sys.exit(serve.main(["--host", "127.0.0.1", "--port", sys.argv[1], "--keep"]))
+sys.exit(serve.main(["--host", "127.0.0.1", "--port", sys.argv[1], "--keep", "--queue"]))
 """
 
 

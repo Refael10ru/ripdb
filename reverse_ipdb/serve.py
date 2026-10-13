@@ -8,13 +8,16 @@ one at a time, with a live roster of who is waiting.
 Usage::
 
     python -m reverse_ipdb.serve [--host HOST] [--port PORT] [--keep]
+                                 [--queue | --cooldown SECONDS]
 
-Without ``--keep`` the listener serves the first container and exits. With
-``--keep`` it keeps serving: detach from one and you drop straight into the
-next one waiting. With ``--no-queue [SECONDS]`` nobody waits: while one
-container is attached, every other one that dials in is told to ``continue``
-on the spot, runs on as if no listener existed, and stays away for SECONDS
-(default 1) before it dials again.
+By default nobody waits: while one container holds the shell, every other
+one that dials in is told to ``continue`` on the spot, runs on as if no
+listener existed, and stays away for ``--cooldown`` seconds (default 1)
+before it dials again. With ``--queue`` they all wait instead:
+each stays paused at its ``set_trace`` and you walk them in arrival order.
+Without ``--keep`` the listener serves the first container and exits; with
+it, it keeps serving — after a detach, the next breakpoint (or the next one
+queued) comes up.
 
 While attached, Ctrl-] is the listener's key and every other key goes to the
 target — Ctrl-C included, which interrupts what the target is running. Ctrl-]
@@ -136,6 +139,7 @@ def _hangup(conn):
         conn.close()
 
 
+DEFAULT_COOLDOWN = 1.0  # the default mode: no queue, turned-away threads stay away 1s
 BANNER_TIMEOUT = 5.0  # a container sends its banner at once; silence means it isn't one
 SEND_TIMEOUT = 5.0    # a target that doesn't take our keystrokes this long is dropped
 QUIT_WINDOW = 1.0     # a second Ctrl-] this soon after a drop quits the listener
@@ -237,18 +241,19 @@ def _pump(conn):
         _restore_terminal(fd, saved)
 
 
-def serve(host="0.0.0.0", port=4444, keep=False, no_queue=None):
+def serve(host="0.0.0.0", port=4444, keep=False, cooldown=DEFAULT_COOLDOWN):
     """Fan in reverse-pdb sessions: accept all, serve one at a time.
 
     A background acceptor takes every incoming container and hands it to a
     short-lived handshake thread, which reads the banner (bounded by
     ``BANNER_TIMEOUT``, so a silent client holds up nobody) and answers at
-    once. By default the answer is our terminal size and the container is
-    queued (so nothing is refused and each stays paused); the foreground
-    drives them one at a time in arrival order. With ``no_queue`` (a cooldown
-    in seconds), only one container holds the slot — attached or queued — and
-    every other one is answered ``continue`` with a ``cooldown``: it runs on
-    immediately and doesn't dial again for that long.
+    once. By default only one container holds the slot — attached or about to
+    be — and every other one is answered ``continue`` with ``cooldown``
+    (seconds): it runs on immediately and doesn't dial again for that long.
+    With ``cooldown=None`` (``--queue``) every container
+    is answered with our terminal size and queued (so nothing is refused and
+    each stays paused); the foreground drives them one at a time in arrival
+    order.
 
     Every container we hold is released — hung up, so it runs on — when its
     session ends, when it is dropped, and when the listener exits for any
@@ -257,8 +262,8 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=None):
     """
     sessions = queue.Queue()
     stopping = threading.Event()
-    slot = threading.Lock()   # --no-queue: held from arrival until detach
-    continued = collections.Counter()  # --no-queue: turned away while the slot was held
+    slot = threading.Lock()   # no-queue mode: held from arrival until detach
+    continued = collections.Counter()  # no-queue mode: turned away while the slot was held
     continued_lock = threading.Lock()  # handshake threads count, the foreground reports
     held = set()              # every container we haven't released yet
     held_lock = threading.Lock()
@@ -280,8 +285,8 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=None):
                 return
             ident = _identity(protocol.decode(line)) or f"{addr[0]}:{addr[1]}"
             conn.settimeout(None)
-            if no_queue is not None and not slot.acquire(blocking=False):
-                _reply(conn, {"continue": True, "cooldown": no_queue})
+            if cooldown is not None and not slot.acquire(blocking=False):
+                _reply(conn, {"continue": True, "cooldown": cooldown})
                 release(conn)
                 with continued_lock:
                     continued[ident] += 1  # reported in one line on detach
@@ -296,7 +301,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=None):
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((host, port))
         listener.listen(128)  # roomy backlog so a burst of containers isn't refused
-        mode = ("fan-in" if no_queue is None else f"no queue, {no_queue:g}s cooldown")
+        mode = ("queue" if cooldown is None else f"no queue, {cooldown:g}s cooldown")
         mode += ", keep-alive" if keep else ", one-shot"
         _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit; "
               "while attached, Ctrl-] drops the session (twice: quit)")
@@ -343,7 +348,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=None):
                 if outcome == "stalled":
                     outcome = f"dropped (not reading input for {SEND_TIMEOUT:g}s)"
                 _note(f"{outcome}: {ident}")
-                if no_queue is not None:
+                if cooldown is not None:
                     with continued_lock:
                         _note_continued(continued)
                     slot.release()
@@ -366,22 +371,27 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="reverse_ipdb.serve",
-        description="Fan in reverse-connecting pdb sessions from many containers.",
+        description="Catch reverse-connecting pdb sessions from many containers.",
     )
     parser.add_argument("--host", default="0.0.0.0",
                         help="interface to bind (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=4444,
                         help="port to listen on (default: 4444)")
     parser.add_argument("--keep", action="store_true",
-                        help="after a detach, drop into the next waiting container "
-                             "instead of exiting")
-    parser.add_argument("--no-queue", nargs="?", const=1.0, type=float, metavar="SECONDS",
-                        help="don't queue: while a container is attached, any other "
-                             "that dials in is told to continue, and to stay away for "
-                             "SECONDS (default 1) before dialing again")
+                        help="after a detach, keep serving (the next breakpoint, or "
+                             "the next one queued) instead of exiting")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--queue", action="store_true",
+                      help="every container that dials in waits, paused at its "
+                           "breakpoint, and you walk them in arrival order (default: "
+                           "while one holds the shell, the others are told to continue)")
+    mode.add_argument("--cooldown", type=float, metavar="SECONDS",
+                      help="a container told to continue stays away this long before "
+                           f"dialing again (default: {DEFAULT_COOLDOWN:g}; not with --queue)")
     args = parser.parse_args(argv)
     try:
-        serve(args.host, args.port, args.keep, args.no_queue)
+        cooldown = DEFAULT_COOLDOWN if args.cooldown is None else args.cooldown
+        serve(args.host, args.port, args.keep, None if args.queue else cooldown)
     except KeyboardInterrupt:
         print("\n*** bye", file=sys.stderr)
         return 0

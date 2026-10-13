@@ -145,17 +145,18 @@ After the reply the socket is a raw vt100 terminal until it closes.
 
 Not part of the target-side stack; it runs on **your** machine as the other
 end of the socket (`python -m reverse_ipdb.serve`, or a plain `socat`/`nc`). A
-background acceptor fans in **every** connecting container at once, handing
+background acceptor takes **every** connecting container at once, handing
 each to a short-lived handshake thread that reads its banner (with a timeout,
-so a silent client holds up nobody), answers it *at once* with the terminal
-size and queues it so none is refused — while the foreground serves them one
-at a time with a live roster (`--keep` to advance into the next instead of
-exiting). With `--no-queue [SECONDS]` the handshake instead answers `continue`
-plus that cooldown (default 1s) whenever another container already holds the
-slot, and that container runs on untouched; the listener stays silent while a
-session is attached (the terminal belongs to the remote shell then) and
-reports the turned-away containers in one digest line on detach, grouped by
-process with a thread count. Each session is a raw-mode pass-through: it
+so a silent client holds up nobody) and answers it *at once*, while the
+foreground serves sessions one at a time with a live roster (`--keep` to
+advance into the next instead of exiting). By default the handshake answers
+`continue` plus a cooldown (`--cooldown`, default 1s) whenever another
+container already holds the slot, and that container runs on untouched; the
+listener stays silent while a session is attached (the terminal belongs to
+the remote shell then) and reports the turned-away containers in one digest
+line on detach, grouped by process with a thread count. With `--queue` it
+answers every container with the terminal size instead and queues it, so none
+is refused and each waits its turn. Each session is a raw-mode pass-through: it
 forwards bytes both ways via select (so completion and special keys work) and
 returns the instant the socket closes. Ctrl-] is the one key kept for the
 listener, as its terminal interrupt key: it drops the session, and a second
