@@ -1,8 +1,8 @@
 """The banner/reply handshake: a ``continue`` reply means "no shell, run on".
 
-``reverse_ipdb-serve --no-queue`` answers every container beyond the one it is
-busy with by ``continue``. The target must then hang up, release the shell
-lock and resume — without ever importing IPython.
+``reverse_ipdb-serve`` (by default; not with ``--queue``) answers every
+container beyond the one it is busy with by ``continue``. The target must then
+hang up, release the shell lock and resume — without ever importing IPython.
 """
 
 import socket

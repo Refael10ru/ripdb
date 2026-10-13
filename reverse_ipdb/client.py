@@ -39,7 +39,7 @@ _local = _ThreadState()
 
 
 def cool_down(seconds):
-    """Told to ``continue`` for ``seconds`` (reverse_ipdb-serve --no-queue while
+    """Told to ``continue`` for ``seconds`` (reverse_ipdb-serve, by default, while
     it's busy): this thread stops dialing for that long, so a hot loop doesn't
     pay a round trip per pass. Thread-local: other threads are unaffected.
     """

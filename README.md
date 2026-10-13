@@ -72,10 +72,10 @@ Configuration resolves **argument → environment variable → default**:
 **On your machine**, catch the session. Either use the bundled listener:
 
 ```sh
-uv run reverse_ipdb-serve               # serve the first container, then exit
-uv run reverse_ipdb-serve --keep        # fan-in: detach one, drop into the next waiting
-uv run reverse_ipdb-serve --keep --no-queue  # don't queue: everyone else just continues
-uv run reverse_ipdb-serve --keep --no-queue 5  # …and stays away 5s before dialing again
+uv run reverse_ipdb-serve               # serve the first breakpoint, then exit
+uv run reverse_ipdb-serve --keep        # keep serving: after a detach, the next breakpoint
+uv run reverse_ipdb-serve --keep --cooldown 5  # turned-away threads stay away 5s (default 1)
+uv run reverse_ipdb-serve --keep --queue  # queue: everyone waits, walk them one at a time
 uv run reverse_ipdb-serve --port 4444   # pick the port
 # (or: python -m reverse_ipdb.serve, once the package is installed)
 ```
@@ -88,7 +88,7 @@ socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr
 # nc works too but mangles completion (line-buffered, local echo)
 ```
 
-### Many containers (fan-in)
+### Many containers
 
 This is what the reverse model is *for*. When your code runs across many
 containers, point them all at the **one** listener and run it with `--keep`:
@@ -101,12 +101,34 @@ DEBUG_HOST=<your-machine> DEBUG_PORT=4444   # reverse_ipdb.set_trace() reads the
 uv run reverse_ipdb-serve --keep
 ```
 
-The listener accepts **every** container that hits a breakpoint right away —
-none is ever refused — and each stays paused at its `set_trace` until it's
-your turn. You get a live roster and walk them one at a time:
+By default **the first container to hit a breakpoint gets the shell, and
+nobody waits for it**. Every other one that hits a breakpoint meanwhile is told
+to **continue** on the spot and runs on untouched, exactly as if no listener
+were running. That thread then stays away for a cooldown (1 s, or
+`--cooldown SECONDS`), so a hot loop doesn't pay a round trip per pass. After
+you detach, the next breakpoint anywhere comes up:
 
 ```
-*** reverse_ipdb listening on 0.0.0.0:4444 (fan-in, keep-alive) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
+*** reverse_ipdb listening on 0.0.0.0:4444 (no queue, 1s cooldown, keep-alive) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
+*** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
+*** attached: web-7f9c pid=12 thread=MainThread
+   … debug web-7f9c; meanwhile other breakpoints just continue, silently …
+*** detached: web-7f9c pid=12 thread=MainThread
+*** continued ×1201 while attached: worker-3a1 pid=9 (12 threads) ×1200, worker-4b0 pid=3 thread=MainThread
+```
+
+While you're attached the terminal belongs to that shell, so the listener
+stays quiet; the containers it turned away meanwhile are summed up in one
+line when you detach, grouped by process (a loop across many threads is one
+entry, not one per thread).
+
+**Want them to wait instead?** Add `--queue`. Then the listener accepts
+**every** container that hits a breakpoint right away — none is ever refused —
+and each stays paused at its `set_trace` until it's your turn. You get a live
+roster and walk them one at a time:
+
+```
+*** reverse_ipdb listening on 0.0.0.0:4444 (queue, keep-alive) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** queued: worker-3a1 pid=9 thread=Thread-2    (2 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread  (1 still waiting)
@@ -122,8 +144,8 @@ the target, Ctrl-C included:
 
 - **Ctrl-]** drops the session (roster: `dropped:`). The target detaches and
   runs on, finishing any command it was in the middle of, and the next one
-  waiting comes up. It works even when the target is stuck: the terminal turns
-  it into a signal for the listener, which nothing can block.
+  comes up. It works even when the target is stuck: the terminal turns it into
+  a signal for the listener, which nothing can block.
 - **A second Ctrl-] right after** (within a second), or **Ctrl-C at the idle
   roster**, quits the listener. Every container still waiting on it is released
   and runs on, and your terminal is restored.
@@ -134,29 +156,7 @@ keystrokes for 5 s is dropped (`dropped (not reading input …)`).
 
 You never connect *to* the containers — they come to you. (This is exactly
 what forward debuggers like madbg can't do: there you'd chase N endpoints.)
-
-Don't want a queue? Add `--no-queue`. Then only one container is yours at a
-time; every other one that hits a breakpoint meanwhile is told to **continue**
-on the spot and runs on untouched, exactly as if no listener were running
-(`--no-queue 5` also tells it to stay away for 5 seconds; the default is 1):
-
-```
-*** reverse_ipdb listening on 0.0.0.0:4444 (no queue, 1s cooldown, keep-alive) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
-*** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
-*** attached: web-7f9c pid=12 thread=MainThread
-   … debug web-7f9c; meanwhile other breakpoints just continue, silently …
-*** detached: web-7f9c pid=12 thread=MainThread
-*** continued ×1201 while attached: worker-3a1 pid=9 (12 threads) ×1200, worker-4b0 pid=3 thread=MainThread
-```
-
-While you're attached the terminal belongs to that shell, so the listener
-stays quiet; the containers it turned away meanwhile are summed up in one
-line when you detach, grouped by process (a loop across many threads is one
-entry, not one per thread). A thread that was told to continue also stays
-away for the cooldown you chose, so a hot loop doesn't pay a round trip per
-pass.
-
-The bundled `serve` identifies each container by its banner, keeps the fan-in
+The bundled `serve` identifies each container by its banner, keeps the
 roster, and — for IPython (pty) sessions — puts your terminal in raw mode so
 completion and special keys pass straight through.
 
@@ -229,7 +229,7 @@ reverse_ipdb/
   client.py      target side: resolve host/port, dial out, single-shell lock
   debugger.py    ReverseIPdb (IPython TerminalPdb) + detach-on-quit mixin
   pty_bridge.py  IPython-over-pty launcher so prompt_toolkit completion works
-  serve.py       the fan-in listener: python -m reverse_ipdb.serve
+  serve.py       the listener: python -m reverse_ipdb.serve
 examples/        runnable scripts for trying it locally (see examples/README.md)
 tests/           pytest suite (unit + end-to-end over a real socket)
 ```
