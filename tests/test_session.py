@@ -4,6 +4,9 @@
   while the program keeps running — otherwise a fan-in listener stays on the
   finished session and the next queued container never comes up.
 - ``c`` with no breakpoints detaches (nothing could bring the prompt back).
+- Ctrl-C from the listener interrupts a command evaluating code (main thread
+  or not) or stops the running program at its next line — and never raises
+  into the program's own code.
 
 These tests drive a target subprocess over a raw socket, exactly as
 ``reverse_ipdb-serve`` does.
@@ -24,6 +27,12 @@ TARGET = textwrap.dedent(
     """
     import threading, time
     import reverse_ipdb
+
+    def busy(seconds):          # pure-Python loop: no blocking call to break out of
+        end = time.time() + seconds
+        while time.time() < end:
+            pass
+        return "busy done"
 
     def main():
         reverse_ipdb.set_trace(host="127.0.0.1", port={port})
@@ -248,5 +257,93 @@ def test_listener_hang_up_while_running_detaches_at_next_stop(target):
             srv.accept()[0].close()
         stdout, rc = _finish(proc, srv)
         assert "RESUMED AGAIN" in stdout and rc == 0, stdout
+    finally:
+        srv.close()
+
+
+def test_ctrl_c_interrupts_a_blocking_command(target):
+    """``!time.sleep(30)`` then Ctrl-C: back at the prompt long before 30s."""
+    srv = _listener()
+    proc = target(srv.getsockname()[1])
+    try:
+        conn = _attach(srv)
+        conn.sendall(b"!time.sleep(30)\r")
+        time.sleep(0.5)
+        start = time.time()
+        conn.sendall(b"\x03")
+        _expect(conn, "KeyboardInterrupt", "ipdb>")
+        assert time.time() - start < 10
+        conn.sendall(b"detach\r")
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
+    finally:
+        srv.close()
+
+
+def test_ctrl_c_interrupts_p_in_a_worker_thread(target):
+    """Off the main thread the interrupt is an async exception: a pure-Python
+    loop (here inside ``p``) stops at once, with no "pending" note."""
+    srv = _listener()
+    proc = target(srv.getsockname()[1],
+                  run="t = threading.Thread(target=main); t.start(); t.join()")
+    try:
+        conn = _attach(srv)
+        conn.sendall(b"p busy(30)\r")
+        time.sleep(0.5)
+        conn.sendall(b"\x03")
+        text = _expect(conn, "KeyboardInterrupt", "ipdb>")
+        time.sleep(1.5)                      # past the "pending" note's delay
+        conn.sendall(b"p 6 * 7\r")          # (an empty line would repeat busy(30))
+        text += _expect(conn, "42", "ipdb>")
+        assert "pending" not in text
+        conn.sendall(b"detach\r")
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
+    finally:
+        srv.close()
+
+
+def test_ctrl_c_in_a_blocking_call_off_the_main_thread_says_it_is_pending(target):
+    srv = _listener()
+    proc = target(srv.getsockname()[1],
+                  run="t = threading.Thread(target=main); t.start(); t.join()")
+    try:
+        conn = _attach(srv)
+        conn.sendall(b"!time.sleep(4)\r")
+        time.sleep(0.5)
+        conn.sendall(b"\x03")
+        _expect(conn, "KeyboardInterrupt pending", "KeyboardInterrupt", "ipdb>")
+        conn.sendall(b"detach\r")
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
+    finally:
+        srv.close()
+
+
+def test_ctrl_c_while_running_stops_at_the_next_line(target):
+    """After ``c`` (breakpoint armed far ahead) the program loops for 5s;
+    Ctrl-C stops it at its next line, without raising into it. Repeated
+    presses change nothing."""
+    srv = _listener()
+    proc = target(srv.getsockname()[1],
+                  between="end = time.time() + 5\n    while time.time() < end: pass")
+    try:
+        conn = _attach(srv)
+        line = next(n for n, text in enumerate(TARGET.splitlines(), 1)
+                    if "RESUMED AGAIN" in text) + 1   # the inserted loop adds a line
+        conn.sendall(f"b {line}\r".encode())
+        _expect(conn, "Breakpoint 1", "ipdb>")
+        conn.sendall(b"c\r")
+        time.sleep(1)
+        start = time.time()
+        conn.sendall(b"\x03")
+        time.sleep(0.05)
+        conn.sendall(b"\x03")
+        _expect(conn, "Program interrupted", "while time.time() < end", "ipdb>")
+        assert time.time() - start < 3
+        conn.sendall(b"detach\r")
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
+        assert "Traceback" not in stdout, stdout
     finally:
         srv.close()

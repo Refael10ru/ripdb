@@ -105,7 +105,7 @@ none is ever refused — and each stays paused at its `set_trace` until it's
 your turn. You get a live roster and walk them one at a time:
 
 ```
-*** reverse_ipdb listening on 0.0.0.0:4444 (fan-in, keep-alive) — Ctrl-C to quit; while attached, Ctrl-C or Ctrl-] drops the session
+*** reverse_ipdb listening on 0.0.0.0:4444 (fan-in, keep-alive) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** queued: worker-3a1 pid=9 thread=Thread-2    (2 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread  (1 still waiting)
@@ -116,13 +116,14 @@ your turn. You get a live roster and walk them one at a time:
 
 A session ends with `detach` (or `q`, Ctrl-D, or `c` with no breakpoints set).
 
-**Ctrl-C belongs to the listener, never to the target**, so the listener can't
-get stuck:
+While attached, **Ctrl-] is the listener's key** and every other key goes to
+the target, Ctrl-C included:
 
-- **Ctrl-C while attached** drops the session (roster: `dropped:`). The target
-  detaches and runs on, finishing any command it was in the middle of, and the
-  next one waiting comes up. **Ctrl-]** does the same.
-- **A second Ctrl-C right after** (within a second), or **Ctrl-C at the idle
+- **Ctrl-]** drops the session (roster: `dropped:`). The target detaches and
+  runs on, finishing any command it was in the middle of, and the next one
+  waiting comes up. It works even when the target is stuck: the terminal turns
+  it into a signal for the listener, which nothing can block.
+- **A second Ctrl-] right after** (within a second), or **Ctrl-C at the idle
   roster**, quits the listener. Every container still waiting on it is released
   and runs on, and your terminal is restored.
 
@@ -138,7 +139,7 @@ time; every other one that hits a breakpoint meanwhile is told to **continue**
 on the spot and runs on untouched, exactly as if no listener were running:
 
 ```
-*** reverse_ipdb listening on 0.0.0.0:4444 (no queue, keep-alive) — Ctrl-C to quit; while attached, Ctrl-C or Ctrl-] drops the session
+*** reverse_ipdb listening on 0.0.0.0:4444 (no queue, keep-alive) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
 *** queued: web-7f9c pid=12 thread=MainThread  (1 waiting)
 *** attached: web-7f9c pid=12 thread=MainThread
 *** continued: worker-3a1 pid=9 thread=Thread-2
@@ -160,8 +161,15 @@ your program.**
 |---------------------|----------------------------------------------------|
 | `detach` / `q` / Ctrl-D | remove breakpoints, close the socket, **let the program continue** |
 | `c` (continue)      | resume; the session stays open for your breakpoints. With **no** breakpoints set it detaches, since nothing could bring the prompt back |
-| Ctrl-C / Ctrl-]     | handled by the listener: drop this session (the target detaches and runs on); see above |
-| Ctrl-U              | clear the line (what Ctrl-C does in a local shell) |
+| Ctrl-C              | at the prompt: clear the line. During a command that runs code (`!time.sleep(60)`, `p slow()`): interrupt it, back to the prompt. While the program runs (after `n`, `c`...): stop at the next line it runs. It never raises into the program itself |
+| Ctrl-]              | handled by the listener: drop this session (the target detaches and runs on); see above |
+
+Ctrl-C reaches the target as a keystroke, not as a signal to the process, so
+the program's own SIGINT handler is never involved. Outside the main thread,
+Python can only interrupt between bytecodes: a pure-Python loop stops at once,
+but a blocking call (`time.sleep`, a socket read) is interrupted only when it
+returns. The shell says so when that happens, and Ctrl-] still drops the
+session meanwhile.
 
 This is deliberate: a stray `q` over a flaky debugging link should never raise
 `BdbQuit` into production code.

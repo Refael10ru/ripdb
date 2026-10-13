@@ -85,6 +85,11 @@ The interactive behaviour, and the byte pipe that carries it.
   detaches and runs on instead of staying paused. Until it does, the output
   pump discards whatever the debugger writes, so a dead connection never
   blocks or raises into the program.
+- `ReverseIPdb.interrupt()` — the socket->pty pump hands it each Ctrl-C byte
+  (no SIGINT exists for a pty that isn't the controlling terminal). During a
+  command that evaluates code it raises `KeyboardInterrupt` in that command;
+  while the program runs it stops at the next line; at the prompt the byte
+  passes on and clears the line. It never raises into the program's own code.
 - `DetachMixin` — redefines `q` / `quit` / `exit` / EOF (and `c` when no
   breakpoint is set) to **detach and
   continue** (via that teardown hook) instead of raising `BdbQuit` into the
@@ -107,9 +112,10 @@ With `--no-queue` the handshake answers `continue` instead whenever another
 container already holds the slot, and that container runs on untouched. Each
 session is a raw-mode pass-through: it forwards bytes both ways via select (so
 completion and special keys work) and returns the instant the socket closes.
-Ctrl-C stays a signal for the listener: it drops the session, and a second
-one right after quits. Ctrl-] also drops it, and a target that stops reading
-input is dropped after a timeout. Every container held is released (hung up,
+Ctrl-] is the one key kept for the listener, as its terminal interrupt key:
+it drops the session, and a second one right after quits. Ctrl-C goes to the
+target like any other key. A target that stops reading input is dropped after
+a timeout. Every container held is released (hung up,
 so it runs on) when its session ends and when the listener exits.
 One bad session is caught and never brings the listener down. It is documented
 alongside the layers because it speaks the same wire protocol, but it depends

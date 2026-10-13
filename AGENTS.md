@@ -58,6 +58,17 @@ Guarantees callers rely on — **do not break these**:
   pump keeps reading and discarding, so the debugger's writes (a command's
   output, the stack at the next breakpoint) neither block nor fail into the
   program. Only the output pump closes the master, once the slave is closed.
+- **Ctrl-C without signals, never into the program.** The pty is nobody's
+  controlling terminal, so a `\x03` from the listener raises no SIGINT; the
+  socket->pty pump hands it to `ReverseIPdb.interrupt()`. At the prompt it
+  passes on (prompt_toolkit clears the line). During a command that evaluates
+  code — `default` (`!x`, bare statements), `p`, `pp`, marked with
+  `_evaluates_code` — it raises `KeyboardInterrupt` in the debugging thread
+  (real SIGINT for a main thread with Python's default handler, else an async
+  exception); those commands never resume the program, so it can only land in
+  them or in pdb's prompt loop, which catches it. While the program runs it
+  only calls `set_step()`. Other debugger commands ignore it. Never install a
+  SIGINT handler in the target, and never raise into the program's own code.
 - **POSIX only.** A pty is required, so the package imports `termios` at the
   top level — `import reverse_ipdb` only works on a Unix platform.
 
@@ -79,10 +90,12 @@ listener — `nc` mangles completion (line-buffered + local echo).
 
 The listener must **never become unresponsive**:
 
-- **Ctrl-C is the listener's.** Raw mode keeps `ISIG` on (with `VQUIT` /
-  `VSUSP` disabled), so Ctrl-C is a SIGINT here and never reaches the target.
-  While attached it drops the session (`dropped:`); a second one within
-  `QUIT_WINDOW`, or one at the idle roster, quits. Ctrl-] drops too.
+- **Ctrl-] is the listener's.** Raw mode keeps `ISIG` on with `VINTR` set to
+  Ctrl-] (and `VQUIT` / `VSUSP` disabled), so Ctrl-] is a SIGINT here — it
+  breaks the listener out of anything — and never reaches the target. While
+  attached it drops the session (`dropped:`); a second one within
+  `QUIT_WINDOW` quits. Ctrl-C at the idle roster quits as usual. Every other
+  key, Ctrl-C included, goes to the target.
 - **No socket can block it.** Banners are read by one short-lived thread per
   connection, bounded by `BANNER_TIMEOUT` (silent clients: `ignored:`), and
   keystrokes are sent with `SEND_TIMEOUT` (a target not reading is dropped).
@@ -171,8 +184,9 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   (one holds the slot, the rest get `continue`, slot frees on detach), Ctrl-]
   dropping the attached session, a silent client holding up nobody, a target
   not reading input being dropped, exit releasing everyone still waiting, and
-  — under a real pty — Ctrl-C dropping, a second Ctrl-C quitting, and the
-  terminal restored.
+  — under a real pty — Ctrl-C passed to the target, Ctrl-] dropping, a second
+  Ctrl-] quitting with the terminal restored, and Ctrl-C quitting the idle
+  roster.
 - `tests/test_handshake.py` — the target's side of the reply line: size /
   `continue` / hang-up / silence, and a `continue`d target resumes without
   importing IPython and can dial again.
@@ -180,7 +194,8 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   hangs up **while the program keeps running** (the queue-stall regression),
   `c` without breakpoints detaches, and a **listener** hang-up releases the
   target — at its prompt, mid-command (output still flowing) and between
-  breakpoints.
+  breakpoints; and Ctrl-C interrupting a command (main and worker thread, with
+  the "pending" note for a blocking call) or stopping the running program.
 - `tests/test_api.py` — default routing to the pty bridge and aliasing.
 - `tests/test_client.py` — fail-open and shell-lock acquire/release via `dial()`.
 
@@ -193,8 +208,11 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
 - A completion **menu** (several candidates) stays open until dismissed; clear
   the line (Ctrl-U) before typing `detach`.
 - Mid-session terminal **resize** isn't propagated — size is sent once at attach.
-- There is no way to interrupt a long command on the target from the listener:
-  Ctrl-C drops the session instead, and the target runs on once the command
-  finishes. Clear the input line with Ctrl-U.
+- Ctrl-C in a **worker thread** is an async exception: it can't break a
+  blocking C call (`time.sleep`, `recv`), only land after it returns. The shell
+  prints "KeyboardInterrupt pending" when that happens; Ctrl-] is the way out.
+- Ctrl-C while the program runs stops at the next line **it traces**. After
+  `c` with breakpoints, frames without breakpoints may not be traced, so it can
+  take until the current call returns. It never escalates into the program.
 - IPython is a hard dependency (it brings prompt_toolkit); runtime deps = just
   IPython, everything else stdlib.

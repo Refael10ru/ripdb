@@ -15,11 +15,11 @@ next one waiting. With ``--no-queue`` nobody waits: while one container is
 attached, every other one that dials in is told to ``continue`` on the spot
 and runs on as if no listener existed.
 
-Ctrl-C always belongs to the listener, never to the target. While attached,
-it drops the session (the target detaches and runs on) and the next one in
-the queue comes up; a second Ctrl-C right after, or one at the idle roster,
-quits — releasing every container still waiting. Ctrl-] drops the session
-too, without the quit. Every other key goes to the target.
+While attached, Ctrl-] is the listener's key and every other key goes to the
+target — Ctrl-C included, which interrupts what the target is running. Ctrl-]
+drops the session (the target detaches and runs on) and the next one in the
+queue comes up; a second Ctrl-] right after quits, releasing every container
+still waiting. At the idle roster, Ctrl-C quits as usual.
 """
 
 import argparse
@@ -109,8 +109,8 @@ def _hangup(conn):
 
 BANNER_TIMEOUT = 5.0  # a container sends its banner at once; silence means it isn't one
 SEND_TIMEOUT = 5.0    # a target that doesn't take our keystrokes this long is dropped
-QUIT_WINDOW = 1.0     # a second Ctrl-C this soon after a drop quits the listener
-DROP_KEY = b"\x1d"    # Ctrl-], telnet's escape: drop the attached session
+QUIT_WINDOW = 1.0     # a second Ctrl-] this soon after a drop quits the listener
+DROP_KEY = b"\x1d"    # Ctrl-], telnet's escape: the listener's own key while attached
 
 
 def _disabled_char(fd):
@@ -123,16 +123,18 @@ def _disabled_char(fd):
 
 
 def _raw_with_signals(fd):
-    r"""Raw mode for the pass-through, except that Ctrl-C stays a signal.
+    r"""Raw mode for the pass-through, with Ctrl-] as the one signal key.
 
-    Every key goes to the target unchanged (TAB, arrows, Ctrl-U, Ctrl-\, ...)
-    but Ctrl-C raises ``KeyboardInterrupt`` in the listener, which also breaks
-    it out of any blocking call: the listener can never be wedged. Ctrl-\ and
-    Ctrl-Z are switched off as signals, so they can't kill or suspend it.
+    Every key goes to the target unchanged (TAB, arrows, Ctrl-C, Ctrl-\, ...)
+    except Ctrl-], which the terminal turns into a SIGINT for the listener:
+    ``KeyboardInterrupt`` here, which also breaks it out of any blocking call,
+    so the listener can never be wedged. Ctrl-\ and Ctrl-Z are switched off
+    as signals, so they can't kill or suspend it.
     """
     tty.setraw(fd)
     attrs = termios.tcgetattr(fd)
     attrs[3] |= termios.ISIG
+    attrs[6][termios.VINTR] = DROP_KEY
     off = _disabled_char(fd)
     for name in ("VQUIT", "VSUSP", "VDSUSP"):
         try:
@@ -143,7 +145,7 @@ def _raw_with_signals(fd):
 
 
 def _restore_terminal(fd, saved):
-    """Put the terminal back, with SIGINT held off so a Ctrl-C landing right
+    """Put the terminal back, with SIGINT held off so a Ctrl-] landing right
     now can't leave it in raw mode."""
     if saved is None:
         return
@@ -158,18 +160,18 @@ def _restore_terminal(fd, saved):
 def _pump(conn):
     """Raw pass-through bridge: a transparent terminal between you and the target.
 
-    Shuttles bytes both ways via select — keystrokes (TAB included) reach the
-    target's prompt_toolkit and its vt100 rendering comes straight back.
+    Shuttles bytes both ways via select — keystrokes (TAB and Ctrl-C
+    included) reach the target and its vt100 rendering comes straight back.
     Returns how the session ended:
 
     - ``"detached"`` — the target hung up (you detached), the instant it does;
-    - ``"dropped"``  — you pressed Ctrl-], the one key never sent on;
+    - ``"dropped"``  — Ctrl-] arrived as a byte (stdin isn't a terminal);
     - ``"stalled"``  — the target stopped taking input for ``SEND_TIMEOUT``.
 
-    Ctrl-C is not passed on: it raises ``KeyboardInterrupt`` here, and the
-    caller drops the session. Whatever was typed before the attach (into the
-    roster, not the session) is discarded. The terminal size was already sent
-    when the container was queued.
+    On a terminal Ctrl-] never arrives as a byte: it raises
+    ``KeyboardInterrupt`` here, and the caller drops the session. Whatever was
+    typed before the attach (into the roster, not the session) is discarded.
+    The terminal size was already sent when the container was queued.
     """
     fd = sys.stdin.fileno()
     saved = None
@@ -220,8 +222,8 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
 
     Every container we hold is released — hung up, so it runs on — when its
     session ends, when it is dropped, and when the listener exits for any
-    reason. Ctrl-C while attached drops the session; a second one within
-    ``QUIT_WINDOW`` (or any Ctrl-C at the idle roster) quits.
+    reason. Ctrl-] while attached drops the session; a second one within
+    ``QUIT_WINDOW`` (or Ctrl-C at the idle roster) quits.
     """
     sessions = queue.Queue()
     stopping = threading.Event()
@@ -262,7 +264,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
         listener.listen(128)  # roomy backlog so a burst of containers isn't refused
         mode = ("no queue" if no_queue else "fan-in") + (", keep-alive" if keep else ", one-shot")
         _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit; "
-              "while attached, Ctrl-C or Ctrl-] drops the session")
+              "while attached, Ctrl-] drops the session (twice: quit)")
 
         def acceptor():
             while not stopping.is_set():
@@ -297,7 +299,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, no_queue=False):
                     if last_drop is not None and now - last_drop < QUIT_WINDOW:
                         release(conn)
                         _note(f"dropped: {ident}")
-                        raise  # second Ctrl-C in a row: quit
+                        raise  # second Ctrl-] in a row: quit
                     last_drop = now
                     outcome = "dropped"
                 except Exception as exc:  # one bad session must not kill the listener

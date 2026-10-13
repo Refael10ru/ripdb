@@ -344,14 +344,15 @@ sys.exit(serve.main(["--host", "127.0.0.1", "--port", sys.argv[1], "--keep"]))
 """
 
 
-def test_ctrl_c_belongs_to_the_listener():
-    """On a real terminal: Ctrl-C is never sent to the target. It drops the
-    attached session; a second one right after quits, releasing whoever is
-    still queued and restoring the terminal. Ctrl-\\ is just a key."""
+def test_ctrl_bracket_is_the_listeners_key_on_a_terminal():
+    """On a real terminal: Ctrl-C and Ctrl-\\ are just keys for the target.
+    Ctrl-] never reaches it: it drops the attached session, a second one right
+    after quits, releasing whoever is still queued and restoring the terminal.
+    At the idle roster Ctrl-C quits."""
     port = _free_port()
     master, slave = pty.openpty()
     # Like a shell would: the pty is the listener's controlling terminal, so
-    # Ctrl-C becomes a SIGINT for it (its own session, slave as ctty).
+    # its interrupt key becomes a SIGINT for it (own session, slave as ctty).
     proc = subprocess.Popen([sys.executable, "-c", LISTENER_UNDER_PTY, str(port)],
                             stdin=slave, stdout=slave, stderr=slave, close_fds=True,
                             start_new_session=True,
@@ -371,40 +372,61 @@ def test_ctrl_c_belongs_to_the_listener():
                 return True
         return False
 
+    def dial(name):
+        c = socket.create_connection(("127.0.0.1", port), timeout=5)
+        c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
+        assert SIZE_LINE.match(_recv_line(c))
+        conns.append(c)
+        return c
+
     conns = []
     try:
         assert read_until("listening")
-
-        def dial(name):
-            c = socket.create_connection(("127.0.0.1", port), timeout=5)
-            c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
-            assert SIZE_LINE.match(_recv_line(c))
-            conns.append(c)
-            return c
-
         a, b, c = dial("aaa"), dial("bbb"), dial("ccc")
         assert read_until("attached: aaa")
         time.sleep(0.3)
-        os.write(master, b"\x03")
+        os.write(master, b"\x03\x1c")                     # Ctrl-C, Ctrl-\\: keys for the target
         a.settimeout(3)
-        assert a.recv(65536) == b""                      # hung up, and no \x03 reached it
+        got = b""
+        while len(got) < 2:
+            got += a.recv(65536)
+        assert got == b"\x03\x1c"
+        os.write(master, b"\x1d")                          # Ctrl-]: drop
+        assert _released(a)
         assert read_until("dropped: aaa") and read_until("attached: bbb")
 
-        time.sleep(serve_mod.QUIT_WINDOW + 0.3)            # a lone Ctrl-C: only drops
-        os.write(master, b"\x1c")                          # Ctrl-\ goes through as a key
-        b.settimeout(3)
-        assert b.recv(65536) == b"\x1c"
-        os.write(master, b"\x03")
+        time.sleep(serve_mod.QUIT_WINDOW + 0.3)            # a lone Ctrl-]: only drops
+        os.write(master, b"\x1d")
         assert _released(b) and read_until("attached: ccc")
-
         time.sleep(0.3)
-        os.write(master, b"\x03")                          # second Ctrl-C in a row: quit
+        os.write(master, b"\x1d")                          # second Ctrl-] in a row: quit
         assert proc.wait(timeout=5) == 0
         assert _released(c)
         assert termios.tcgetattr(master)[3] & termios.ICANON   # terminal back to cooked
     finally:
         for conn in conns:
             conn.close()
+        if proc.poll() is None:
+            proc.kill()
+        os.close(master)
+
+
+def test_ctrl_c_at_the_idle_roster_quits():
+    port = _free_port()
+    master, slave = pty.openpty()
+    proc = subprocess.Popen([sys.executable, "-c", LISTENER_UNDER_PTY, str(port)],
+                            stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+                            start_new_session=True,
+                            preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
+    os.close(slave)
+    try:
+        end, out = time.time() + 5, b""
+        while b"listening" not in out and time.time() < end:
+            if select.select([master], [], [], 0.1)[0]:
+                out += os.read(master, 65536)
+        os.write(master, b"\x03")
+        assert proc.wait(timeout=5) == 0
+    finally:
         if proc.poll() is None:
             proc.kill()
         os.close(master)

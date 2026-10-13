@@ -291,10 +291,28 @@ def run(frame, host=None, port=None):
     output_pump = threading.Thread(target=pump_output, daemon=True)
     dbg._reverse_ipdb_close = close
 
+    def to_pty(data):
+        """listener -> pty. Ctrl-C bytes go to the debugger first: the pty is
+        nobody's controlling terminal, so on its own a ``\\x03`` would only
+        ever reach a prompt. Those the debugger handles are not passed on."""
+        if b"\x03" in data:
+            parts = data.split(b"\x03")
+            kept = bytearray(parts[0])
+            for part in parts[1:]:
+                handled = False
+                with contextlib.suppress(Exception):
+                    handled = dbg.interrupt()
+                if not handled:
+                    kept += b"\x03"
+                kept += part
+            data = bytes(kept)
+        if data:
+            write_master(data)
+
     # Pump bytes both ways; either EOF tears the whole bridge down.
     output_pump.start()
     threading.Thread(
-        target=_pump, args=(sock.recv, write_master, close),
+        target=_pump, args=(sock.recv, to_pty, close),
         daemon=True,
     ).start()
 
