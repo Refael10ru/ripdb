@@ -18,10 +18,12 @@ and never raises into the program's own code:
 """
 
 import asyncio
+import bdb
 import contextlib
 import ctypes
 import functools
 import signal
+import sys
 import threading
 
 from IPython.terminal.debugger import TerminalPdb
@@ -79,7 +81,8 @@ class DetachMixin:
     def do_detach(self, arg):
         """detach | q | Ctrl-D
         Remove all breakpoints, tear down the connection, let the program run."""
-        self.clear_all_breaks()
+        self._clear_own_breaks()
+        self._reverse_ipdb_detached = True  # trace_dispatch releases us after this stop
         close = getattr(self, "_reverse_ipdb_close", None)
         if close is not None:
             close()  # set by pty_bridge: shut down the prompt, close pty + socket
@@ -87,6 +90,25 @@ class DetachMixin:
 
     # 'q' would normally raise BdbQuit inside the program; make it detach.
     do_quit = do_q = do_exit = do_EOF = do_detach
+
+    def set_break(self, *args, **kwargs):
+        """bdb's set_break, remembering which Breakpoint objects are ours.
+
+        bdb keeps every breakpoint in one process-wide registry and its
+        ``clear_all_breaks`` empties all of it — another session's included
+        (one still running after a hang-up, while a newer one is attached).
+        """
+        first_new = len(bdb.Breakpoint.bpbynumber)
+        error = super().set_break(*args, **kwargs)
+        self.__dict__.setdefault("_reverse_ipdb_breaks", []).extend(
+            bp for bp in bdb.Breakpoint.bpbynumber[first_new:] if bp is not None)
+        return error
+
+    def _clear_own_breaks(self):
+        for bp in self.__dict__.pop("_reverse_ipdb_breaks", []):
+            if bdb.Breakpoint.bpbynumber[bp.number] is bp:  # not already cleared
+                bp.deleteMe()
+        self.breaks = {}
 
     def do_continue(self, arg):
         """c(ont(inue))
@@ -115,6 +137,14 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         super().__init__(*args, **kwargs)
         self._reverse_ipdb_lock = threading.Lock()
         self._reverse_ipdb_hung_up = False
+        # Set by detach or a listener hang-up; from then on the next trace
+        # event in the debugged thread releases everything (see _release).
+        self._reverse_ipdb_detached = False
+        self._reverse_ipdb_released = False
+        # True while the debugged thread is inside trace_dispatch: pdb may
+        # print ("--Return--", "--Call--") before a stop even begins, so a
+        # hang-up then must not count as idle and close the pty under it.
+        self._reverse_ipdb_dispatching = False
         self._reverse_ipdb_loop = None  # the running prompt's event loop, if any
         # Ctrl-C bookkeeping. The thread that called set_trace is the one that
         # stops, runs the commands and runs the program.
@@ -129,7 +159,13 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
     do_pp = _evaluates_code(TerminalPdb.do_pp)
 
     def interaction(self, frame, tb_or_exc):
-        self._reverse_ipdb_state = IN_DEBUGGER
+        # Under the lock that hang_up takes: either the listener's hang-up sees
+        # us stopped (and leaves the pty to us), or we see the hang-up and
+        # never stop again — a stop can't begin on a pty being torn down.
+        with self._reverse_ipdb_lock:
+            if self._reverse_ipdb_detached:
+                return None
+            self._reverse_ipdb_state = IN_DEBUGGER
         self._reverse_ipdb_stopping = False
         try:
             return super().interaction(frame, tb_or_exc)
@@ -192,6 +228,13 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         app.pre_run_callables.append(arm)
         try:
             return super()._prompt()
+        except EOFError:
+            # What cmdloop would make of it — but said here, in the prompt
+            # thread: re-raised in the debugged thread, the exception's
+            # traceback would capture cmdloop's frame and, through f_back,
+            # the debugged frame and its locals, keeping them alive in a
+            # cycle until the garbage collector happens to run.
+            return "EOF"
         finally:
             self._reverse_ipdb_state = IN_DEBUGGER
             with self._reverse_ipdb_lock:
@@ -202,8 +245,10 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
 
         Closing fds under a blocked prompt never wakes it, so end the prompt
         directly: now if one is up, else as soon as the next one starts (after
-        a running command, or at the next breakpoint). Either way the program
-        detaches and runs on.
+        a running command). Either way the program detaches and runs on, and
+        no stop begins after this. Returns whether the debugger is idle — not
+        inside a stop — in which case nothing will touch the pty again and the
+        bridge retires it right away.
         """
         app = self.pt_app.app
 
@@ -213,7 +258,90 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
 
         with self._reverse_ipdb_lock:
             self._reverse_ipdb_hung_up = True
+            self._reverse_ipdb_detached = True
             loop = self._reverse_ipdb_loop
+            idle = (self._reverse_ipdb_state == RUNNING
+                    and not self._reverse_ipdb_dispatching)
         if loop is not None:
             with contextlib.suppress(RuntimeError):  # loop already closed: prompt is over
                 loop.call_soon_threadsafe(end_prompt)
+        if idle:
+            self._close_pt_loop()  # no prompt will ever use it; don't wait for _release
+        return idle
+
+    def trace_dispatch(self, frame, event, arg):
+        """bdb's trace function, until this session is over; then ``_release``.
+
+        Detach (or a hang-up) can't release everything on the spot: pdb is
+        still inside its stop then. The first trace event after it — in the
+        debugged thread, outside any stop — does it, and from then on this
+        debugger traces nothing.
+        """
+        with self._reverse_ipdb_lock:
+            detached = self._reverse_ipdb_detached
+            self._reverse_ipdb_dispatching = not detached
+        if not detached:
+            try:
+                result = super().trace_dispatch(frame, event, arg)
+            finally:
+                with self._reverse_ipdb_lock:
+                    self._reverse_ipdb_dispatching = False
+            if not self._reverse_ipdb_detached:
+                return result
+        self._release()
+        return None
+
+    def _release(self):
+        """Let go of the debugged program and of this session's resources.
+
+        bdb's ``set_continue`` unhooks every frame *except* the outermost one
+        it hooked (``botframe``: the module's top level, or a thread's
+        bootstrap frame — alive as long as the program or thread), and IPython
+        keeps the stopped frame in ``initial_frame``. Left alone, the last
+        debugger, its stopped frame and every local in it stay reachable until
+        the next session replaces them — or forever. Runs in the debugged
+        thread; idempotent.
+        """
+        if getattr(sys.gettrace(), "__self__", None) is self:
+            sys.settrace(None)
+        frame = sys._getframe()
+        while frame is not None:
+            if getattr(frame.f_trace, "__self__", None) is self:
+                frame.f_trace = None
+            frame = frame.f_back
+        del frame
+        if self._reverse_ipdb_released:
+            return
+        self._reverse_ipdb_released = True
+        close = getattr(self, "_reverse_ipdb_close", None)
+        if close is not None:
+            close()  # from this thread: retires the prompt thread and the pty slave
+        self._reverse_ipdb_close = None  # the bridge's closure refers back to us
+        # Breakpoints still armed (a hang-up after `c`) live in bdb's
+        # process-wide Breakpoint registry, not just on this debugger.
+        with contextlib.suppress(Exception):
+            self._clear_own_breaks()
+        for name in ("botframe", "stopframe", "returnframe", "curframe",
+                     "frame_returning", "initial_frame"):
+            setattr(self, name, None)
+        self.stack = []
+        if "curframe_locals" in vars(self):  # a plain attribute up to 3.13
+            self.curframe_locals = {}
+        # TerminalPdb points its completer at the stopped frame's locals and
+        # globals before every prompt, for tab completion.
+        with contextlib.suppress(AttributeError):
+            self._ptcomp.ipy_completer.namespace = {}
+            self._ptcomp.ipy_completer.global_namespace = {}
+        for name in ("tb_lineno", "displaying", "_skip_cache", "_parent_skip_cache"):
+            with contextlib.suppress(AttributeError):
+                getattr(self, name).clear()
+        self._close_pt_loop()
+
+    def _close_pt_loop(self):
+        """IPython's TerminalPdb makes an event loop per debugger and never
+        closes it (nor uses it): an epoll fd and a socketpair, until garbage
+        collection otherwise. Idempotent; called from the pump on an idle
+        hang-up and from the debugged thread in _release, so it's serialized
+        (a loop's close() isn't thread-safe)."""
+        with self._reverse_ipdb_lock, contextlib.suppress(AttributeError, RuntimeError):
+            self.pt_loop.close()

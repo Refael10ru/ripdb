@@ -138,7 +138,12 @@ def run(frame, sock, release, cols, rows):
     closed = False
     debugging_thread = threading.get_ident()  # runs the prompt loop and do_detach
 
-    def close_slave():
+    def retire_slave():
+        """Nothing will prompt on the pty again: retire the prompt thread and
+        close the slave (the output pump then drains, ends, closes the master).
+        Idempotent."""
+        with contextlib.suppress(Exception):
+            dbg.thread_executor.shutdown(wait=False)
         for closer in (slave_in.close, slave_out.close):
             with contextlib.suppress(OSError):
                 closer()
@@ -206,19 +211,23 @@ def run(frame, sock, release, cols, rows):
             first = not closed
             closed = True
         if from_debugger:
-            # It has left its prompt for good: retire the prompt thread (only
-            # here — a debugger still mid-command needs it for one more,
-            # hung-up prompt) and the slave.
-            with contextlib.suppress(Exception):
-                dbg.thread_executor.shutdown(wait=False)
-            close_slave()
+            # It has left its prompt for good (only here — a debugger still
+            # mid-command needs the prompt thread for one more, hung-up prompt).
+            retire_slave()
         if not first:
             return
         if from_debugger:
             output_pump.join(timeout=DRAIN_TIMEOUT)  # slave closed: it drains, then ends
         else:
+            idle = False
             with contextlib.suppress(Exception):
-                dbg.hang_up()
+                idle = dbg.hang_up()
+            if idle:
+                # Not inside a stop or the trace function, and neither can
+                # start now: nothing will read or write the pty again — even
+                # if the program never traces another line (thread ended, or
+                # blocked for good). Retire it here instead of waiting.
+                retire_slave()
         release()  # shuts down + closes the socket (waking the socket->pty pump), frees the lock
 
     output_pump = threading.Thread(target=pump_output, daemon=True)
