@@ -82,8 +82,8 @@ THIRD_PARTY = {
         "TerminalPdb's one-thread prompt executor: shut down when the session ends",
     ("debugger", "self.pt_loop.close"):
         "TerminalPdb's per-instance asyncio loop (unused, never closed by IPython)",
-    ("debugger", "self.clear_all_breaks"):
-        "bdb's process-wide Breakpoint registry entries this session created",
+    ("debugger", "self._clear_own_breaks"):
+        "bdb's process-wide Breakpoint registry: only the entries this debugger created",
 }
 
 
@@ -113,7 +113,7 @@ def _visit(node, module, func, scope, calls, daemonless):
             name = _call_name(child)
             if name:
                 calls.setdefault((module, func, name), []).append(child.lineno)
-                if name in THREAD_CALLS and not _is_daemon(child, scope):
+                if name in THREAD_CALLS and not _is_daemon(child, node, scope):
                     daemonless.append(f"{module}.{func}:{child.lineno}")
         _visit(child, module, inner, inner_scope, calls, daemonless)
 
@@ -136,14 +136,20 @@ def _scan():
     return calls, state, daemonless
 
 
-def _is_daemon(call, scope):
+def _is_daemon(call, parent, scope):
     if any(k.arg == "daemon" and isinstance(k.value, ast.Constant) and k.value.value is True
            for k in call.keywords):
         return True
-    # Timer takes no daemon= argument: accept `<name>.daemon = True` in the same function.
+    # Timer takes no daemon= argument: accept `x = threading.Timer(...)` followed by
+    # `x.daemon = True` in the same function — for that very variable.
+    if not (isinstance(parent, ast.Assign) and len(parent.targets) == 1
+            and isinstance(parent.targets[0], ast.Name)):
+        return False
+    var = parent.targets[0].id
     return any(isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Attribute)
-               and n.targets[0].attr == "daemon" and isinstance(n.value, ast.Constant)
-               and n.value.value is True for n in ast.walk(scope))
+               and n.targets[0].attr == "daemon" and _dotted(n.targets[0].value) == var
+               and isinstance(n.value, ast.Constant) and n.value.value is True
+               for n in ast.walk(scope))
 
 
 # Calls at module/class level that build behaviour, not state.

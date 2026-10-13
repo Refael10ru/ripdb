@@ -30,7 +30,8 @@ traced memory.
 | "KeyboardInterrupt pending" timer | `ReverseIPdb.interrupt` | one-shot daemon, ends after 1 s |
 | trace hooks on the debugged thread's frames and `sys.settrace` | bdb | `ReverseIPdb._release` at the first trace event after the session |
 | breakpoints in bdb's process-wide registry | bdb | cleared on detach and in `_release` |
-| the debugger object, its stopped frame, the frame's locals | — | unreferenced once the program resumes; freed by reference counting, without waiting for the garbage collector |
+| the stopped frame and its locals | — | freed by reference counting as soon as the program is done with them |
+| the debugger object and its prompt session (about 820 KiB) | — | unreachable once the program resumes; in IPython/prompt_toolkit reference cycles, so freed at the next GC pass |
 
 ## What was found and fixed
 
@@ -45,13 +46,19 @@ traced memory.
   prompt loop's frame and, through `f_back`, the debugged frame, so locals were
   freed only when the garbage collector ran. `_prompt` now turns end-of-file
   into the `"EOF"` command inside the prompt thread.
+- **bdb's `clear_all_breaks` cleared every breakpoint in the process.** That
+  included those of a newer session in another thread, while an older one was
+  still releasing. Each debugger now deletes only the `Breakpoint` objects it
+  created.
 - **IPython's per-debugger event loop was never closed.** It held 3 fds until
   the garbage collector ran. It is now closed.
 - **A hang-up while the program ran left the session alive.** If the program
   never stopped or traced again (blocked, or the thread ended), the pty, pump
   and prompt thread stayed forever. A hang-up that finds the debugger idle now
-  retires them at once. A lock shared with the start of each stop keeps a new
-  stop from beginning on a closed pty.
+  retires them at once. It counts as idle only outside a stop and outside the
+  trace function, because pdb prints `--Return--` / `--Call--` before a stop
+  begins. A lock shared with both keeps a new stop from beginning on a closed
+  pty.
 - **Breakpoints left armed by such a hang-up stayed in bdb's registry.** They
   are now cleared.
 
@@ -72,6 +79,14 @@ traced memory.
   `!while True: pass` after the listener has gone, keeps its session until it
   returns. User code can't be stopped safely from outside, and Ctrl-C from the
   listener is the tool for that while attached.
+- **The debugger object waits for the GC.** IPython's prompt-text closure and
+  prompt_toolkit's own objects form reference cycles, so each finished
+  debugger holds about 820 KiB until the next collection. Normal programs
+  collect automatically. A program that runs with `gc.disable()` keeps one
+  per session until it collects.
+- **A suspended generator stepped into during a session.** It keeps our trace
+  function on its frame, and so the debugger object (not the stopped frame),
+  until it resumes, where the hook removes itself, or is collected.
 - **A blocked thread's trace hook.** After a hang-up, a thread that never runs
   Python again keeps our trace function, and with it the debugger object without
   any frames or pty, until it does run.
