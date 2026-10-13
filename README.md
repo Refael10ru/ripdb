@@ -195,6 +195,10 @@ This is deliberate: a stray `q` over a flaky debugging link should never raise
 - **No surprises in the target.** It doesn't hijack the program's Ctrl-C handler
   (`nosigint`) and doesn't read a stray `~/.pdbrc` from inside the container
   (`readrc=False`).
+- **Leaves nothing behind.** A breakpoint that gets no shell builds no
+  debugger. After a session, the debugger, the stopped frame and its locals
+  are freed at once, along with the pty, threads and sockets. What each
+  allocation is and when it is freed: [docs/lifecycles.md](docs/lifecycles.md).
 - **Leaving is immediate, from either end.** The moment you detach, the target
   hangs up (a `shutdown`, not just a `close`, so the listener sees it even while
   the program keeps running) and the next queued container comes up. When the

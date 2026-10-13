@@ -2,7 +2,8 @@
 
 Orientation for an agent (or human) picking this up. For usage prose see
 [README.md](README.md); for the completion internals see
-[docs/completion.md](docs/completion.md) and [docs/api-layers.md](docs/api-layers.md).
+[docs/completion.md](docs/completion.md) and [docs/api-layers.md](docs/api-layers.md); for
+what is allocated and when it is freed, [docs/lifecycles.md](docs/lifecycles.md).
 
 ## What it is
 
@@ -70,6 +71,15 @@ Guarantees callers rely on — **do not break these**:
   them or in pdb's prompt loop, which catches it. While the program runs it
   only calls `set_step()`. Other debugger commands ignore it. Never install a
   SIGINT handler in the target, and never raise into the program's own code.
+- **Nothing outlives a session.** After detach or any hang-up, the debugger,
+  its stopped frame and that frame's locals are unreachable and freed by
+  reference counting. `ReverseIPdb._release` unhooks every frame (bdb leaves
+  `botframe` hooked), drops frame refs and the completer's namespaces, and
+  closes IPython's unused `pt_loop`. End-of-file becomes `"EOF"` inside the
+  prompt thread, so no traceback carries frames across threads. A hang-up that
+  finds the debugger idle retires the pty and threads at once. Every allocation
+  is listed with its release in `tests/test_lifecycle_static.py`; see
+  `docs/lifecycles.md`.
 - **POSIX only.** A pty is required, so the package imports `termios` at the
   top level — `import reverse_ipdb` only works on a Unix platform.
 
@@ -231,6 +241,14 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   target — at its prompt, mid-command (output still flowing) and between
   breakpoints; and Ctrl-C interrupting a command (main and worker thread, with
   the "pending" note for a blocking call) or stopping the running program.
+- `tests/test_lifecycle.py` — one process through hundreds of no-listener and
+  turned-away breakpoints and ten sessions ending every way: no fds, threads,
+  debuggers or prompt sessions left, the stopped frame's 1 MiB local freed
+  without the GC, about 11 KiB per session left over (prompt_toolkit); and a
+  hang-up while the program is blocked releases the session at once.
+- `tests/test_lifecycle_static.py` — every resource-creating call has a
+  documented release (`LIFECYCLES`), every thread is a daemon, and every
+  module-level state is accounted for (`MODULE_STATE`).
 - `tests/test_api.py` — hand-off to `client.attach` and aliasing.
 - `tests/test_layers.py` — the import graph matches `docs/api-layers.md`.
 - `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,

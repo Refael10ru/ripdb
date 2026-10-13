@@ -217,8 +217,17 @@ def run(frame, sock, release, cols, rows):
         if from_debugger:
             output_pump.join(timeout=DRAIN_TIMEOUT)  # slave closed: it drains, then ends
         else:
+            idle = False
             with contextlib.suppress(Exception):
-                dbg.hang_up()
+                idle = dbg.hang_up()
+            if idle:
+                # Not inside a stop, and none can start now: nothing will read
+                # or write the pty again — even if the program never traces
+                # another line (thread ended, or blocked for good). Retire the
+                # prompt thread and the slave here instead of waiting.
+                with contextlib.suppress(Exception):
+                    dbg.thread_executor.shutdown(wait=False)
+                close_slave()
         release()  # shuts down + closes the socket (waking the socket->pty pump), frees the lock
 
     output_pump = threading.Thread(target=pump_output, daemon=True)
