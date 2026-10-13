@@ -4,6 +4,7 @@ The full pty + dot-completion + clean-exit path is covered by test_completion.py
 """
 
 import contextlib
+import json
 import socket
 import subprocess
 import sys
@@ -81,6 +82,6 @@ def test_broken_debugger_env_fails_open():
     assert "RESUMED" in stdout
     assert "debugger import failed" in stderr and "Error: No module named" in stderr
     for text in received:                       # the listener sees why, both times
-        assert text.startswith("*** reverse_ipdb/pty"), text      # banner first
+        assert json.loads(text.splitlines()[0])["reverse_ipdb"] == "pty"   # banner first
         assert "*** reverse_ipdb: debugger import failed" in text, text
         assert "Error: No module named" in text

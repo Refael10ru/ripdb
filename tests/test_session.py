@@ -23,6 +23,8 @@ import time
 import pytest
 from test_completion import ANSI, _recv_until
 
+from reverse_ipdb import protocol
+
 TARGET = textwrap.dedent(
     """
     import threading, time
@@ -112,7 +114,7 @@ def _attach(srv):
     conn.settimeout(10)
     while not conn.recv(1).endswith(b"\n"):
         pass
-    conn.sendall(b"80 24\n")
+    conn.sendall(protocol.encode({"cols": 80, "rows": 24}))
     _, got_prompt = _recv_until(conn, "ipdb>")
     assert got_prompt, "never saw the ipdb> prompt"
     return conn

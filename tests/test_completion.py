@@ -1,12 +1,15 @@
 """End-to-end: IPython-over-pty gives real dot-completion, and the target
 process exits cleanly after detach (no leaked prompt_toolkit threads)."""
 
+import json
 import re
 import socket
 import subprocess
 import sys
 import textwrap
 import time
+
+from reverse_ipdb import protocol
 
 # The completed attribute name ("zqzzmark") is assembled at runtime from
 # single characters, so that contiguous string appears NOWHERE in this source.
@@ -64,17 +67,12 @@ def test_dot_completion_and_clean_exit():
         conn, _ = srv.accept()
 
         # 1) banner must announce pty mode
-        banner = bytearray()
         conn.settimeout(10)
-        while not banner.endswith(b"\n"):
-            b = conn.recv(1)
-            if not b:
-                break
-            banner += b
-        assert banner.decode().startswith("*** reverse_ipdb/pty"), banner
+        banner = json.loads(protocol.read_line(conn))
+        assert banner["reverse_ipdb"] == "pty", banner
 
         # 2) send our terminal size, then wait for the prompt to come up
-        conn.sendall(b"80 24\n")
+        conn.sendall(protocol.encode({"cols": 80, "rows": 24}))
         before, got_prompt = _recv_until(conn, "ipdb>")
         assert got_prompt, "never saw the ipdb> prompt"
         # Echo-proof: the completed string must NOT already be present (e.g. from

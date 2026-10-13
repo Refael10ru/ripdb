@@ -1,10 +1,11 @@
-"""Tests for the fan-in listener: banner parsing, no-container-refused, --no-queue."""
+"""Tests for the fan-in listener: banner parsing, no-container-refused, --no-queue,
+Ctrl-] and Ctrl-C on a real terminal, and never blocking or leaving anyone paused."""
 
+import collections
 import contextlib
 import fcntl
 import os
 import pty
-import re
 import select
 import socket
 import subprocess
@@ -15,40 +16,48 @@ import time
 
 import pytest
 
+from reverse_ipdb import protocol
 from reverse_ipdb import serve as serve_mod
 
 
-def test_read_banner_strips_tag_without_overreading():
+def _banner(**fields):
+    return protocol.encode({"reverse_ipdb": "pty", **fields})
+
+
+def test_read_banner_builds_identity_without_overreading():
     a, b = socket.socketpair()
     # Banner line followed immediately by debugger output on the same stream.
-    a.sendall(b"*** reverse_ipdb/pty host pid=1 thread=MainThread\n\x1b[?2004h(ipdb) ")
-    ident = serve_mod._read_banner(b)
-    assert ident == "host pid=1 thread=MainThread"
+    a.sendall(_banner(host="host", pid=1, thread="MainThread") + b"\x1b[?2004h(ipdb) ")
+    assert serve_mod._read_banner(b) == "host pid=1 thread=MainThread"
     # The bytes after the banner must still be readable (not consumed).
-    rest = b.recv(4096)
-    assert rest == b"\x1b[?2004h(ipdb) "
+    assert b.recv(4096) == b"\x1b[?2004h(ipdb) "
     a.close()
     b.close()
 
 
-def test_read_banner_empty_on_immediate_close():
+def test_read_banner_tolerates_missing_and_unknown_keys():
+    a, b = socket.socketpair()
+    a.sendall(_banner(pid=7, future="ignored"))
+    assert serve_mod._read_banner(b) == "pid=7"
+    a.close()
+    b.close()
+
+
+def test_read_banner_empty_on_immediate_close_or_garbage():
     a, b = socket.socketpair()
     a.close()
     assert serve_mod._read_banner(b) == ""
     b.close()
+    a, b = socket.socketpair()
+    a.sendall(b"*** reverse_ipdb/pty host pid=1 thread=MainThread\n")   # pre-JSON banner
+    assert serve_mod._read_banner(b) == ""
+    a.close()
+    b.close()
 
 
-SIZE_LINE = re.compile(rb"^\d+ \d+\n$")
-
-
-def _recv_line(c):
-    buf = bytearray()
-    while not buf.endswith(b"\n"):
-        chunk = c.recv(1)
-        if not chunk:
-            break
-        buf += chunk
-    return bytes(buf)
+def _is_size(line):
+    msg = protocol.decode(line)
+    return isinstance(msg.get("cols"), int) and isinstance(msg.get("rows"), int)
 
 
 def _wait(pred, timeout=5):
@@ -92,7 +101,7 @@ def test_simultaneous_containers_are_all_queued_none_refused():
         # Fire several "containers" at once.
         for i in range(5):
             c = socket.create_connection(("127.0.0.1", port), timeout=2)
-            c.sendall(f"container-{i} pid={100 + i} thread=MainThread\n".encode())
+            c.sendall(_banner(host=f"container-{i}", pid=100 + i, thread="MainThread"))
             conns.append(c)
 
         # All five must show up as queued (none refused).
@@ -110,7 +119,7 @@ def test_simultaneous_containers_are_all_queued_none_refused():
         # (not only when attached, which could be minutes later).
         for c in conns:
             c.settimeout(5)
-            assert SIZE_LINE.match(_recv_line(c)), c
+            assert _is_size(protocol.read_line(c)), c
     finally:
         serve_mod._note = original_note
         for c in conns:
@@ -118,8 +127,8 @@ def test_simultaneous_containers_are_all_queued_none_refused():
 
 
 def test_no_queue_continues_everyone_while_busy():
-    """--no-queue: one container holds the slot; the rest are told to continue,
-    and the slot frees up on detach."""
+    """--no-queue: one container holds the slot; the rest are told to continue
+    (reported as one digest line on detach), and the slot frees up on detach."""
     port = _free_port()
     notes = []
     original_note, original_pump = serve_mod._note, serve_mod._pump
@@ -131,7 +140,7 @@ def test_no_queue_continues_everyone_while_busy():
         return "detached"
 
     serve_mod._pump = hold_until_remote_closes
-    t = threading.Thread(target=serve_mod.serve, args=("127.0.0.1", port, True, True),
+    t = threading.Thread(target=serve_mod.serve, args=("127.0.0.1", port, True, 2.5),
                          daemon=True)
     t.start()
     conns = []
@@ -140,25 +149,31 @@ def test_no_queue_continues_everyone_while_busy():
 
         def dial(name):
             c = socket.create_connection(("127.0.0.1", port), timeout=5)
-            c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
+            c.sendall(_banner(host=name, pid=1, thread="MainThread"))
             conns.append(c)
             return c
 
         first = dial("first")
-        assert SIZE_LINE.match(_recv_line(first))             # gets a shell
+        assert _is_size(protocol.read_line(first))                    # gets a shell
         assert _wait(lambda: any("attached: first" in m for m in notes))
 
-        second = dial("second")
-        assert _recv_line(second) == b"continue\n"            # told to run on
-        assert second.recv(1) == b""                           # and hung up
-        assert _wait(lambda: any("continued: second" in m for m in notes)), notes
-        assert not any("queued: second" in m for m in notes)
+        for _ in range(3):                                     # a loop hitting its breakpoint
+            second = dial("second")
+            reply = protocol.decode(protocol.read_line(second))
+            assert reply == {"continue": True, "cooldown": 2.5}
+            assert second.recv(1) == b""                       # and hung up
+        assert not any("continued" in m or "queued: second" in m for m in notes), notes
 
         first.close()                                          # detach
         assert _wait(lambda: any("detached: first" in m for m in notes))
+        # The turned-away arrivals are reported once, after the session, not
+        # sprayed over the raw-mode shell while it was attached.
+        assert _wait(lambda: any(
+            m == "continued ×3 while attached: second pid=1 thread=MainThread ×3"
+            for m in notes)), notes
 
         third = dial("third")
-        assert SIZE_LINE.match(_recv_line(third))             # slot is free again
+        assert _is_size(protocol.read_line(third))                    # slot is free again
         assert _wait(lambda: any("attached: third" in m for m in notes))
     finally:
         for c in conns:
@@ -173,47 +188,54 @@ def test_no_queue_flag_is_wired(monkeypatch):
                         lambda host, port, keep, no_queue: captured.update(
                             keep=keep, no_queue=no_queue))
     serve_mod.main(["--no-queue", "--keep"])
-    assert captured == {"keep": True, "no_queue": True}
+    assert captured == {"keep": True, "no_queue": 1.0}      # default cooldown
+    serve_mod.main(["--no-queue", "0.5"])
+    assert captured == {"keep": False, "no_queue": 0.5}
+    serve_mod.main([])
+    assert captured == {"keep": False, "no_queue": None}    # fan-in
+
+
+def test_continued_digest_groups_by_container(capsys):
+    counts = collections.Counter()
+    serve_mod._note_continued(counts)                 # nothing to say
+    assert capsys.readouterr().err == ""
+
+    counts.update(["a"] * 5 + ["b"] * 2 + ["c", "d", "e"])
+    serve_mod._note_continued(counts)
+    assert capsys.readouterr().err == "*** continued ×10 while attached: a ×5, b ×2, c, +2 more\n"
+    assert not counts                                 # drained
+
+
+def test_continued_digest_groups_threads_by_process(capsys):
+    # Many threads of one process looping through the breakpoint are one entry.
+    counts = collections.Counter()
+    for t in range(12):
+        counts[f"worker-3a1 pid=9 thread=Thread-{t}"] += 100
+    counts["web-7f9c pid=12 thread=MainThread"] += 1
+    serve_mod._note_continued(counts)
+    assert capsys.readouterr().err == (
+        "*** continued ×1201 while attached: "
+        "worker-3a1 pid=9 (12 threads) ×1200, web-7f9c pid=12 thread=MainThread\n"
+    )
 
 
 def test_ctrl_bracket_drops_the_attached_session(monkeypatch):
     """Ctrl-] never reaches the target: the listener closes that session itself
     and moves on to the next one queued — the way out of a stuck target."""
-    port = _free_port()
-    notes = []
-    monkeypatch.setattr(serve_mod, "_note", lambda msg: notes.append(msg))
-    stdin_r, stdin_w = os.pipe()
-    stdout_r, stdout_w = os.pipe()
-    monkeypatch.setattr(sys, "stdin", os.fdopen(stdin_r, "rb", buffering=0))
-    monkeypatch.setattr(sys, "stdout", os.fdopen(stdout_w, "wb", buffering=0))
-    t = threading.Thread(target=serve_mod.serve, args=("127.0.0.1", port, True), daemon=True)
-    t.start()
-    conns = []
+    lst = _Listener(monkeypatch)
     try:
-        assert _wait(lambda: any("listening" in m for m in notes))
-
-        def dial(name):
-            c = socket.create_connection(("127.0.0.1", port), timeout=5)
-            c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
-            assert SIZE_LINE.match(_recv_line(c))
-            conns.append(c)
-            return c
-
-        first, second = dial("first"), dial("second")
-        assert _wait(lambda: any("attached: first" in m for m in notes))
-        os.write(stdin_w, b"x" + serve_mod.DROP_KEY + b"ignored")
+        first, second = lst.dial("first"), lst.dial("second")
+        assert lst.noted("attached: first")
+        os.write(lst.stdin_w, b"x" + serve_mod.DROP_KEY + b"ignored")
         first.settimeout(5)
         assert first.recv(1) == b"x"       # typed before Ctrl-] still went through
         assert first.recv(1) == b""        # then the listener hung up on it
-        assert _wait(lambda: any("dropped: first" in m for m in notes)), notes
-        assert _wait(lambda: any("attached: second" in m for m in notes)), notes
+        assert lst.noted("dropped: first")
+        assert lst.noted("attached: second")
         second.sendall(b"hello")
-        assert os.read(stdout_r, 5) == b"hello"
+        assert lst.read_output(b"hello") == b"hello"
     finally:
-        for c in conns:
-            c.close()
-        os.close(stdin_w)
-        os.close(stdout_r)
+        lst.close()
 
 
 class _Listener:
@@ -225,8 +247,10 @@ class _Listener:
         monkeypatch.setattr(serve_mod, "_note", self.notes.append)
         stdin_r, self.stdin_w = os.pipe()
         self.stdout_r, stdout_w = os.pipe()
-        monkeypatch.setattr(sys, "stdin", os.fdopen(stdin_r, "rb", buffering=0))
-        monkeypatch.setattr(sys, "stdout", os.fdopen(stdout_w, "wb", buffering=0))
+        self.stdin = os.fdopen(stdin_r, "rb", buffering=0)
+        self.stdout = os.fdopen(stdout_w, "wb", buffering=0)
+        monkeypatch.setattr(sys, "stdin", self.stdin)
+        monkeypatch.setattr(sys, "stdout", self.stdout)
         self.thread = threading.Thread(target=serve_mod.serve,
                                        args=("127.0.0.1", self.port, keep), daemon=True)
         self.thread.start()
@@ -240,19 +264,39 @@ class _Listener:
 
     def dial(self, name):
         c = self.connect()
-        c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
-        assert SIZE_LINE.match(_recv_line(c))
+        c.sendall(_banner(host=name, pid=1, thread="MainThread"))
+        assert _is_size(protocol.read_line(c))
         return c
+
+    def read_output(self, want, timeout=5):
+        """Bytes the listener wrote to its terminal, until ``want`` shows up."""
+        got, end = b"", time.time() + timeout
+        while want not in got and time.time() < end:
+            if select.select([self.stdout_r], [], [], 0.1)[0]:
+                got += os.read(self.stdout_r, 65536)
+        return got
 
     def noted(self, text, timeout=5):
         return _wait(lambda: any(text in m for m in self.notes), timeout)
 
     def close(self):
+        """End every session, and wait for this listener to be idle before
+        closing its pipes: serve() threads outlive the test, and one still
+        pumping would pick up whatever the next test's pipes reuse its fd
+        numbers for."""
         for c in self.conns:
             c.close()
-        for fd in (self.stdin_w, self.stdout_r):
+        ended = ("detached: ", "dropped: ", "dropped (", "session error")
+
+        def idle():
+            attached = sum(m.startswith("attached: ") for m in self.notes)
+            return attached == sum(m.startswith(ended) for m in self.notes)
+
+        assert _wait(idle, timeout=10), self.notes
+        for closer in (lambda: os.close(self.stdin_w), lambda: os.close(self.stdout_r),
+                       self.stdin.close, self.stdout.close):
             with contextlib.suppress(OSError):
-                os.close(fd)
+                closer()
 
 
 def _released(c, timeout=3):
@@ -291,26 +335,36 @@ def test_target_not_reading_input_is_dropped(monkeypatch):
     monkeypatch.setattr(serve_mod, "SEND_TIMEOUT", 0.5)
     lst = _Listener(monkeypatch)
 
+    stop_flood = threading.Event()
+
     def flood():                                          # type far more than fits in buffers
         with contextlib.suppress(OSError):
-            while True:
+            while not stop_flood.is_set():
                 os.write(lst.stdin_w, b"x" * 65536)
+
+    def drain(c):                                         # the next target does read its input
+        with contextlib.suppress(OSError):
+            while c.recv(65536):
+                pass
 
     try:
         stuck = socket.socket()
         stuck.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         stuck.connect(("127.0.0.1", lst.port))
         lst.conns.append(stuck)
-        stuck.sendall(b"*** reverse_ipdb/pty stuck pid=1 thread=MainThread\n")
-        assert SIZE_LINE.match(_recv_line(stuck))
+        stuck.sendall(_banner(host="stuck", pid=1, thread="MainThread"))
+        assert _is_size(protocol.read_line(stuck))
         nxt = lst.dial("next")
+        threading.Thread(target=drain, args=(nxt,), daemon=True).start()
         assert lst.noted("attached: stuck")
         threading.Thread(target=flood, daemon=True).start()
         assert lst.noted("dropped (not reading input", timeout=20), lst.notes
+        stop_flood.set()
         assert lst.noted("attached: next")
         assert _released(stuck, timeout=10)
         nxt.sendall(b"alive")
-        assert b"alive" in os.read(lst.stdout_r, 65536)
+        assert b"alive" in lst.read_output(b"alive")
+        assert not lst.noted("dropped (not reading input for 0.5s): next", timeout=1)
     finally:
         lst.close()
 
@@ -374,8 +428,8 @@ def test_ctrl_bracket_is_the_listeners_key_on_a_terminal():
 
     def dial(name):
         c = socket.create_connection(("127.0.0.1", port), timeout=5)
-        c.sendall(f"*** reverse_ipdb/pty {name} pid=1 thread=MainThread\n".encode())
-        assert SIZE_LINE.match(_recv_line(c))
+        c.sendall(_banner(host=name, pid=1, thread="MainThread"))
+        assert _is_size(protocol.read_line(c))
         conns.append(c)
         return c
 
@@ -389,7 +443,9 @@ def test_ctrl_bracket_is_the_listeners_key_on_a_terminal():
         a.settimeout(3)
         got = b""
         while len(got) < 2:
-            got += a.recv(65536)
+            chunk = a.recv(65536)                           # times out after 3s
+            assert chunk, f"hung up early after {got!r}"
+            got += chunk
         assert got == b"\x03\x1c"
         os.write(master, b"\x1d")                          # Ctrl-]: drop
         assert _released(a)
