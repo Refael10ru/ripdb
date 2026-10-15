@@ -178,6 +178,14 @@ uv run pytest -q        # tests
 CI (`.github/workflows/ci.yml`) runs all three on push/PR for Python 3.11–3.12.
 Keep the gate green.
 
+The library is **fully typed** and checked with `mypy --strict` (`[tool.mypy]`
+in `pyproject.toml`); it ships a `py.typed` marker so callers' type checkers
+see the annotations. Every new function needs annotations. The only
+`# type: ignore`s are for things outside our control — IPython's debugger
+classes are untyped (`no-untyped-call` on `super()` calls into them) and
+`threading`'s private atexit hooks aren't in typeshed (`attr-defined`) — and
+`warn_unused_ignores` (part of strict) flags any that stop being needed.
+
 Ruff enforces **PLC0415** (imports at the top of the file). The one deliberate
 exception is in `pty_bridge.run`, marked `# noqa: PLC0415`: IPython /
 prompt_toolkit / `debugger` are imported there, **after** a listener is

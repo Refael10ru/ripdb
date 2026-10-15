@@ -21,12 +21,16 @@ import sys
 import termios
 import threading
 import traceback
+from collections.abc import Callable, Iterator
+from socket import socket
+from types import FrameType
+from typing import Any
 
 DRAIN_TIMEOUT = 1.0  # on close, how long the last output may take to reach the socket
 
 
 @contextlib.contextmanager
-def _tolerate_shutdown_state():
+def _tolerate_shutdown_state() -> Iterator[None]:
     """Let the debugger imports succeed even if ``threading`` thinks the
     interpreter is already shutting down.
 
@@ -42,26 +46,27 @@ def _tolerate_shutdown_state():
     if not getattr(threading, "_SHUTTING_DOWN", False):
         yield
         return
-    original = threading._register_atexit
+    original = threading._register_atexit  # type: ignore[attr-defined]
 
-    def lenient(func, *args, **kwargs):
-        threading._threading_atexits.append(
+    def lenient(func: Callable[..., object], *args: Any, **kwargs: Any) -> None:
+        threading._threading_atexits.append(  # type: ignore[attr-defined]
             functools.partial(func, *args, **kwargs)
         )
 
-    threading._register_atexit = lenient
+    threading._register_atexit = lenient  # type: ignore[attr-defined]
     try:
         yield
     finally:
-        threading._register_atexit = original
+        threading._register_atexit = original  # type: ignore[attr-defined]
 
 
-def _set_winsize(fd, cols, rows):
+def _set_winsize(fd: int, cols: int, rows: int) -> None:
     with contextlib.suppress(OSError):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def _pump(src_read, dst_write, on_eof):
+def _pump(src_read: Callable[[int], bytes], dst_write: Callable[[bytes], object],
+          on_eof: Callable[[], None]) -> None:
     """Copy src -> dst until either side dies, then fire on_eof once."""
     try:
         while True:
@@ -75,7 +80,7 @@ def _pump(src_read, dst_write, on_eof):
         on_eof()
 
 
-def _abort(sock, release, reason):
+def _abort(sock: socket, release: Callable[[], None], reason: str) -> None:
     """Fail open after dialing: say why on stderr and on the listener, then
     hang up so the program runs on and later breakpoints still work.
     """
@@ -87,7 +92,8 @@ def _abort(sock, release, reason):
     release()
 
 
-def run(frame, sock, release, cols, rows):
+def run(frame: FrameType, sock: socket, release: Callable[[], None], cols: int, rows: int,
+        ) -> None:
     """Drop ``frame`` into IPython's debugger over a pty, on a live ``sock``.
 
     Layer 2 (``client.attach``) already dialed and handshook; ``release``
@@ -138,7 +144,7 @@ def run(frame, sock, release, cols, rows):
     closed = False
     debugging_thread = threading.get_ident()  # runs the prompt loop and do_detach
 
-    def close_slave():
+    def close_slave() -> None:
         for closer in (slave_in.close, slave_out.close):
             with contextlib.suppress(OSError):
                 closer()
@@ -150,13 +156,13 @@ def run(frame, sock, release, cols, rows):
     master_lock = threading.Lock()
     master_open = True
 
-    def write_master(data):
+    def write_master(data: bytes) -> None:
         with master_lock:
             if not master_open:
                 raise OSError("pty closed")
             os.write(master_fd, data)
 
-    def close_master():
+    def close_master() -> None:
         nonlocal master_open
         with master_lock:
             if master_open:
@@ -164,7 +170,7 @@ def run(frame, sock, release, cols, rows):
                 with contextlib.suppress(OSError):
                     os.close(master_fd)
 
-    def pump_output():
+    def pump_output() -> None:
         """pty -> socket. Once the listener is gone, keep reading and discard:
         the debugger may still write (a command's output, the stack at the
         next breakpoint) before it detaches, and a pty nobody reads would
@@ -189,7 +195,7 @@ def run(frame, sock, release, cols, rows):
             close()
             close_master()
 
-    def close():
+    def close() -> None:
         """Tear the bridge down, from either side.
 
         From the debugger (``detach``): it's past its prompt, so close the
@@ -224,7 +230,7 @@ def run(frame, sock, release, cols, rows):
     output_pump = threading.Thread(target=pump_output, daemon=True)
     dbg._reverse_ipdb_close = close
 
-    def to_pty(data):
+    def to_pty(data: bytes) -> None:
         """listener -> pty. Ctrl-C bytes go to the debugger first: the pty is
         nobody's controlling terminal, so on its own a ``\\x03`` would only
         ever reach a prompt. Those the debugger handles are not passed on."""
@@ -250,7 +256,7 @@ def run(frame, sock, release, cols, rows):
     ).start()
 
     try:
-        dbg.set_trace(frame)
+        dbg.set_trace(frame)  # type: ignore[no-untyped-call]  # IPython's Pdb is untyped
     except BaseException:
         close()
         raise

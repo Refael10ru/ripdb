@@ -15,26 +15,31 @@ Listener -> target, the reply (sent at once, from the acceptor)::
 """
 
 import json
+import socket
+from collections.abc import Mapping
+from typing import Any
 
 LINE_LIMIT = 4096  # a handshake line longer than this is not one of ours
 
 
-def encode(fields):
+def encode(fields: Mapping[str, object]) -> bytes:
     """One line carrying ``fields``."""
     return (json.dumps(fields) + "\n").encode("utf-8")
 
 
-def decode(line):
+def decode(line: bytes | None) -> dict[str, Any]:
     """The dict a line carries. Anything that isn't a JSON object (``None``
     from ``read_line`` included) decodes to ``{}``."""
+    if line is None:
+        return {}
     try:
         msg = json.loads(line)
-    except (TypeError, ValueError):
+    except ValueError:
         return {}
-    return msg if isinstance(msg, dict) else {}
+    return dict(msg) if isinstance(msg, dict) else {}
 
 
-def read_line(sock):
+def read_line(sock: socket.socket) -> bytes | None:
     """One handshake line, byte-at-a-time so nothing past it is consumed —
     those bytes belong to the session that follows.
 
