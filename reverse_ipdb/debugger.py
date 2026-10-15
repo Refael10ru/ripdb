@@ -23,8 +23,18 @@ import ctypes
 import functools
 import signal
 import threading
+from collections.abc import Callable
+from types import FrameType, TracebackType
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from IPython.terminal.debugger import TerminalPdb
+
+if TYPE_CHECKING:
+    _Base = TerminalPdb  # the mixin's methods are written against TerminalPdb
+else:
+    _Base = object
+
+_T = TypeVar("_T")
 
 # Where the debugging thread is, as the socket pump sees it.
 RUNNING = "running"          # the program runs; no stop in progress
@@ -35,7 +45,7 @@ IN_CODE = "code"             # stopped, evaluating code for a command (!x, p x)
 PENDING_NOTE_DELAY = 1.0     # an interrupt not landed by then is stuck behind a C call
 
 
-def _raise_keyboard_interrupt(thread_ident):
+def _raise_keyboard_interrupt(thread_ident: int) -> bool:
     """Raise ``KeyboardInterrupt`` in the debugging thread.
 
     The main thread with Python's default SIGINT handler gets a real SIGINT
@@ -55,7 +65,9 @@ def _raise_keyboard_interrupt(thread_ident):
     return False
 
 
-def _evaluates_code(method):
+def _evaluates_code(
+    method: Callable[["ReverseIPdb", str], _T],
+) -> Callable[["ReverseIPdb", str], _T]:
     """Mark a command as running the user's code, so Ctrl-C may interrupt it.
 
     Only these commands: a ``KeyboardInterrupt`` aimed at one of them can only
@@ -63,7 +75,7 @@ def _evaluates_code(method):
     program), and pdb catches it there and prompts again.
     """
     @functools.wraps(method)
-    def wrapper(self, arg):
+    def wrapper(self: "ReverseIPdb", arg: str) -> _T:
         self._reverse_ipdb_command += 1
         self._reverse_ipdb_state = IN_CODE
         try:
@@ -73,22 +85,25 @@ def _evaluates_code(method):
     return wrapper
 
 
-class DetachMixin:
+class DetachMixin(_Base):
     """Make quitting the shell detach-and-continue instead of killing the program."""
 
-    def do_detach(self, arg):
+    # Set by pty_bridge: shuts down the prompt, closes pty + socket.
+    _reverse_ipdb_close: Callable[[], None] | None = None
+
+    def do_detach(self, arg: str) -> bool | None:
         """detach | q | Ctrl-D
         Remove all breakpoints, tear down the connection, let the program run."""
         self.clear_all_breaks()
-        close = getattr(self, "_reverse_ipdb_close", None)
+        close = self._reverse_ipdb_close
         if close is not None:
-            close()  # set by pty_bridge: shut down the prompt, close pty + socket
+            close()
         return super().do_continue(arg)
 
     # 'q' would normally raise BdbQuit inside the program; make it detach.
     do_quit = do_q = do_exit = do_EOF = do_detach
 
-    def do_continue(self, arg):
+    def do_continue(self, arg: str) -> bool | None:
         """c(ont(inue))
         Resume the program. With breakpoints armed the session stays open and
         the prompt comes back at the next one; with none, nothing could ever
@@ -111,11 +126,14 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
     ``_reverse_ipdb_close`` to tear the bridge down on detach.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # IPython's debugger classes are untyped: the ignores on super() calls
+        # below are that, not anything about our own types.
+        super().__init__(*args, **kwargs)  # type: ignore[no-untyped-call]
         self._reverse_ipdb_lock = threading.Lock()
         self._reverse_ipdb_hung_up = False
-        self._reverse_ipdb_loop = None  # the running prompt's event loop, if any
+        # The running prompt's event loop, if any.
+        self._reverse_ipdb_loop: asyncio.AbstractEventLoop | None = None
         # Ctrl-C bookkeeping. The thread that called set_trace is the one that
         # stops, runs the commands and runs the program.
         self._reverse_ipdb_thread = threading.get_ident()
@@ -124,19 +142,28 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         self._reverse_ipdb_command = 0       # bumped per code-evaluating command
         self._reverse_ipdb_noted = -1        # the command we printed "pending" for
 
-    default = _evaluates_code(TerminalPdb.default)
-    do_p = _evaluates_code(TerminalPdb.do_p)
-    do_pp = _evaluates_code(TerminalPdb.do_pp)
+    @_evaluates_code
+    def default(self, line: str) -> None:
+        super().default(line)  # type: ignore[no-untyped-call]
 
-    def interaction(self, frame, tb_or_exc):
+    @_evaluates_code
+    def do_p(self, arg: str) -> bool | None:
+        return super().do_p(arg)
+
+    @_evaluates_code
+    def do_pp(self, arg: str) -> bool | None:
+        return super().do_pp(arg)
+
+    def interaction(self, frame: FrameType | None,
+                    tb_or_exc: TracebackType | BaseException | None) -> None:
         self._reverse_ipdb_state = IN_DEBUGGER
         self._reverse_ipdb_stopping = False
         try:
-            return super().interaction(frame, tb_or_exc)
+            super().interaction(frame, tb_or_exc)  # type: ignore[no-untyped-call]
         finally:
             self._reverse_ipdb_state = RUNNING
 
-    def interrupt(self):
+    def interrupt(self) -> bool:
         """A Ctrl-C byte arrived from the listener (called by the socket pump).
 
         Returns whether it was handled here; if not, the byte goes on to the
@@ -158,7 +185,7 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
             return True
         return False
 
-    def _note_if_still_running(self, command):
+    def _note_if_still_running(self, command: int) -> None:
         """The interrupt went in as an async exception and its command is still
         running: it must be inside a blocking C call, which the exception
         can't break. Say so once, rather than look frozen."""
@@ -171,7 +198,7 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
                          "blocking call returns (Ctrl-] at the listener drops this "
                          "session meanwhile).")
 
-    def _prompt(self):
+    def _prompt(self) -> str:
         """Run one prompt, unless the listener has hung up: then end it as if
         Ctrl-D had been pressed, which the debugger takes as ``detach``.
 
@@ -182,7 +209,7 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         app = self.pt_app.app
         self._reverse_ipdb_state = AT_PROMPT
 
-        def arm():
+        def arm() -> None:
             with self._reverse_ipdb_lock:
                 if self._reverse_ipdb_hung_up:
                     app.exit(exception=EOFError)
@@ -191,13 +218,14 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
 
         app.pre_run_callables.append(arm)
         try:
-            return super()._prompt()
+            line: str = super()._prompt()  # type: ignore[no-untyped-call]
+            return line
         finally:
             self._reverse_ipdb_state = IN_DEBUGGER
             with self._reverse_ipdb_lock:
                 self._reverse_ipdb_loop = None
 
-    def hang_up(self):
+    def hang_up(self) -> None:
         """The listener is gone. Called by the bridge from a pump thread.
 
         Closing fds under a blocked prompt never wakes it, so end the prompt
@@ -207,7 +235,7 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         """
         app = self.pt_app.app
 
-        def end_prompt():
+        def end_prompt() -> None:
             if app.future is not None and not app.future.done():
                 app.exit(exception=EOFError)
 
