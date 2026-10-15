@@ -39,16 +39,18 @@ import termios
 import threading
 import time
 import tty
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from reverse_ipdb import protocol
 
 
-def _note(msg):
+def _note(msg: str) -> None:
     """Print a roster line to stderr, flushed so it shows up live."""
     print(f"*** {msg}", file=sys.stderr, flush=True)
 
 
-def _identity(msg):
+def _identity(msg: Mapping[str, Any]) -> str:
     """``<host> pid=.. thread=..`` from a decoded banner, built from whichever
     of those keys it sent (``""`` if none)."""
     parts = [str(msg["host"])] if "host" in msg else []
@@ -56,12 +58,12 @@ def _identity(msg):
     return " ".join(parts)
 
 
-def _read_banner(conn):
+def _read_banner(conn: socket.socket) -> str:
     """The target's identity from its banner line (see ``protocol``)."""
     return _identity(protocol.decode(protocol.read_line(conn)))
 
 
-def _terminal_size():
+def _terminal_size() -> tuple[int, int]:
     with contextlib.suppress(OSError, ValueError):
         size = os.get_terminal_size(sys.stdin.fileno())
         if size.columns and size.lines:  # a fresh pty can report 0x0
@@ -69,7 +71,7 @@ def _terminal_size():
     return 80, 24
 
 
-def _enable_keepalive(conn):
+def _enable_keepalive(conn: socket.socket) -> None:
     """Probe idle connections, so a container that vanished without a FIN
     (killed, network gone) reads as a hang-up within about a minute and
     stops holding the attached slot. Same cadence as the target side; kept
@@ -85,7 +87,7 @@ def _enable_keepalive(conn):
             conn.setsockopt(socket.IPPROTO_TCP, option, value)
 
 
-def _note_continued(counts):
+def _note_continued(counts: collections.Counter[str]) -> None:
     """One digest line for the containers turned away during a session.
 
     Printed on detach, never mid-session: while attached, the terminal is in
@@ -96,14 +98,14 @@ def _note_continued(counts):
     """
     if not counts:
         return
-    per_proc = collections.Counter()
-    threads = collections.defaultdict(set)
+    per_proc: collections.Counter[str] = collections.Counter()
+    threads: dict[str, set[str]] = collections.defaultdict(set)
     for ident, n in counts.items():
         proc, _, thread = ident.partition(" thread=")
         per_proc[proc] += n
         threads[proc].add(thread)
 
-    def describe(proc, n):
+    def describe(proc: str, n: int) -> str:
         names = threads[proc] - {""}
         who = proc
         if len(names) == 1:
@@ -120,13 +122,13 @@ def _note_continued(counts):
     counts.clear()
 
 
-def _reply(conn, fields):
+def _reply(conn: socket.socket, fields: Mapping[str, object]) -> None:
     """Answer a banner with one protocol line (see ``protocol``)."""
     with contextlib.suppress(OSError):
         conn.sendall(protocol.encode(fields))
 
 
-def _hangup(conn):
+def _hangup(conn: socket.socket) -> None:
     """Release a container: it reads EOF and runs on.
 
     ``shutdown`` before ``close`` so the FIN goes out even if another thread
@@ -146,7 +148,7 @@ QUIT_WINDOW = 1.0     # a second Ctrl-] this soon after a drop quits the listene
 DROP_KEY = b"\x1d"    # Ctrl-], telnet's escape: the listener's own key while attached
 
 
-def _disabled_char(fd):
+def _disabled_char(fd: int) -> bytes:
     """The value that switches a terminal control character off."""
     try:
         value = os.fpathconf(fd, "PC_VDISABLE")
@@ -155,7 +157,7 @@ def _disabled_char(fd):
     return bytes([value & 0xFF])
 
 
-def _raw_with_signals(fd):
+def _raw_with_signals(fd: int) -> None:
     r"""Raw mode for the pass-through, with Ctrl-] as the one signal key.
 
     Every key goes to the target unchanged (TAB, arrows, Ctrl-C, Ctrl-\, ...)
@@ -177,7 +179,7 @@ def _raw_with_signals(fd):
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
-def _restore_terminal(fd, saved):
+def _restore_terminal(fd: int, saved: list[Any] | None) -> None:
     """Put the terminal back, with SIGINT held off so a Ctrl-] landing right
     now can't leave it in raw mode."""
     if saved is None:
@@ -190,7 +192,7 @@ def _restore_terminal(fd, saved):
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
-def _pump(conn):
+def _pump(conn: socket.socket) -> str:
     """Raw pass-through bridge: a transparent terminal between you and the target.
 
     Shuttles bytes both ways via select — keystrokes (TAB and Ctrl-C
@@ -241,7 +243,8 @@ def _pump(conn):
         _restore_terminal(fd, saved)
 
 
-def serve(host="0.0.0.0", port=4444, keep=False, cooldown=DEFAULT_COOLDOWN):
+def serve(host: str = "0.0.0.0", port: int = 4444, keep: bool = False,
+          cooldown: float | None = DEFAULT_COOLDOWN) -> None:
     """Fan in reverse-pdb sessions: accept all, serve one at a time.
 
     A background acceptor takes every incoming container and hands it to a
@@ -260,21 +263,23 @@ def serve(host="0.0.0.0", port=4444, keep=False, cooldown=DEFAULT_COOLDOWN):
     reason. Ctrl-] while attached drops the session; a second one within
     ``QUIT_WINDOW`` (or Ctrl-C at the idle roster) quits.
     """
-    sessions = queue.Queue()
+    sessions: queue.Queue[tuple[socket.socket, str]] = queue.Queue()
     stopping = threading.Event()
     slot = threading.Lock()   # no-queue mode: held from arrival until detach
-    continued = collections.Counter()  # no-queue mode: turned away while the slot was held
-    continued_lock = threading.Lock()  # handshake threads count, the foreground reports
-    held = set()              # every container we haven't released yet
+    # No-queue mode: turned away while the slot was held; handshake threads
+    # count, the foreground reports.
+    continued: collections.Counter[str] = collections.Counter()
+    continued_lock = threading.Lock()
+    held: set[socket.socket] = set()  # every container we haven't released yet
     held_lock = threading.Lock()
     cols, rows = _terminal_size()
 
-    def release(conn):
+    def release(conn: socket.socket) -> None:
         with held_lock:
             held.discard(conn)
         _hangup(conn)
 
-    def handshake(conn, addr):
+    def handshake(conn: socket.socket, addr: tuple[str, int]) -> None:
         try:
             conn.settimeout(BANNER_TIMEOUT)
             line = protocol.read_line(conn)
@@ -306,7 +311,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, cooldown=DEFAULT_COOLDOWN):
         _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit; "
               "while attached, Ctrl-] drops the session (twice: quit)")
 
-        def acceptor():
+        def acceptor() -> None:
             while not stopping.is_set():
                 try:
                     conn, addr = listener.accept()
@@ -323,7 +328,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, cooldown=DEFAULT_COOLDOWN):
         accepting = threading.Thread(target=acceptor, daemon=True)
         accepting.start()
 
-        last_drop = None
+        last_drop: float | None = None
         try:
             while True:
                 conn, ident = sessions.get()
@@ -368,7 +373,7 @@ def serve(host="0.0.0.0", port=4444, keep=False, cooldown=DEFAULT_COOLDOWN):
             accepting.join(timeout=1.0)
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="reverse_ipdb.serve",
         description="Catch reverse-connecting pdb sessions from many containers.",

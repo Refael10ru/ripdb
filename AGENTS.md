@@ -213,6 +213,14 @@ class-level `lru_cache`s keyed on `(debugger, frame)`; `_release` empties
 them, or the debugger and the stopped frame live on. Run the suite under
 both before touching `debugger.py`: `uv run --python 3.10 pytest -q`.
 
+The library is **fully typed** and checked with `mypy --strict` (`[tool.mypy]`
+in `pyproject.toml`); it ships a `py.typed` marker so callers' type checkers
+see the annotations. Every new function needs annotations. The only
+`# type: ignore`s are for things outside our control — IPython's debugger
+classes are untyped (`no-untyped-call` on `super()` calls into them) and
+`threading`'s private atexit hooks aren't in typeshed (`attr-defined`) — and
+`warn_unused_ignores` (part of strict) flags any that stop being needed.
+
 Ruff enforces **PLC0415** (imports at the top of the file). The one deliberate
 exception is in `pty_bridge.run`, marked `# noqa: PLC0415`: IPython /
 prompt_toolkit / `debugger` are imported there, **after** a listener is

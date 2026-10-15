@@ -12,6 +12,8 @@ import os
 import socket
 import threading
 import time
+from collections.abc import Callable
+from types import FrameType
 
 from reverse_ipdb import protocol, pty_bridge
 
@@ -32,13 +34,13 @@ _shell_lock = threading.Lock()
 
 
 class _ThreadState(threading.local):
-    skip_until = 0.0  # monotonic time before which this thread does not dial
+    skip_until: float = 0.0  # monotonic time before which this thread does not dial
 
 
 _local = _ThreadState()
 
 
-def cool_down(seconds):
+def cool_down(seconds: float) -> None:
     """Told to ``continue`` for ``seconds`` (reverse_ipdb-serve, by default, while
     it's busy): this thread stops dialing for that long, so a hot loop doesn't
     pay a round trip per pass. Thread-local: other threads are unaffected.
@@ -46,7 +48,7 @@ def cool_down(seconds):
     _local.skip_until = time.monotonic() + seconds
 
 
-def enable_keepalive(sock):
+def enable_keepalive(sock: socket.socket) -> None:
     """Probe an idle connection so a peer that vanished (container killed,
     network gone) reads as a hang-up within about a minute instead of never.
     """
@@ -61,14 +63,16 @@ def enable_keepalive(sock):
             sock.setsockopt(socket.IPPROTO_TCP, option, value)
 
 
-def resolve_target(host=None, port=None):
+def resolve_target(host: str | None = None, port: int | None = None) -> tuple[str, int]:
     """Resolve the (host, port) to dial, applying env vars and defaults."""
-    host = host or os.environ.get("DEBUG_HOST", DEFAULT_HOST)
-    port = int(port or os.environ.get("DEBUG_PORT", DEFAULT_PORT))
+    if not host:
+        host = os.environ.get("DEBUG_HOST", DEFAULT_HOST)
+    if not port:
+        port = int(os.environ.get("DEBUG_PORT", DEFAULT_PORT))
     return host, port
 
 
-def banner():
+def banner() -> bytes:
     """The first line a target sends: a JSON object saying who we are.
 
     ``reverse_ipdb: pty`` tells the listener what follows is a raw pty stream;
@@ -82,7 +86,8 @@ def banner():
     })
 
 
-def dial(host=None, port=None):
+def dial(host: str | None = None, port: int | None = None,
+         ) -> tuple[socket.socket, Callable[[], None]] | None:
     """Acquire the shell lock and open a socket to the listener.
 
     Returns ``(sock, release)`` or ``None``. ``None`` means nobody is listening
@@ -109,7 +114,7 @@ def dial(host=None, port=None):
     enable_keepalive(sock)
     released = False
 
-    def release():
+    def release() -> None:
         nonlocal released
         if not released:
             released = True
@@ -126,7 +131,7 @@ def dial(host=None, port=None):
     return sock, release
 
 
-def handshake(sock):
+def handshake(sock: socket.socket) -> tuple[int, int] | None:
     """Send our banner and read the listener's reply (see ``protocol``).
 
     ``{"cols": .., "rows": ..}`` -> that terminal size, defaults for what's
@@ -156,7 +161,7 @@ def handshake(sock):
         return DEFAULT_COLS, DEFAULT_ROWS
 
 
-def attach(frame, host=None, port=None):
+def attach(frame: FrameType, host: str | None = None, port: int | None = None) -> None:
     """Dial out and, if the listener wants us, debug ``frame`` over the socket.
 
     Layer 2's whole job: dial, handshake, and hand a live socket *down* to the
