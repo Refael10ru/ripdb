@@ -7,6 +7,10 @@
 - Ctrl-C from the listener interrupts a command evaluating code (main thread
   or not) or stops the running program at its next line — and never raises
   into the program's own code.
+- ``interact`` is a full IPython shell on the frame, over the same connection:
+  completion, assignments that land in the frame, Ctrl-C interrupting a cell,
+  Ctrl-D back to ``ipdb>`` — and a listener hang-up at its prompt still
+  releases the target.
 
 These tests drive a target subprocess over a raw socket, exactly as
 ``reverse_ipdb-serve`` does.
@@ -347,5 +351,80 @@ def test_ctrl_c_while_running_stops_at_the_next_line(target):
         stdout, rc = _finish(proc, srv)
         assert "RESUMED AGAIN" in stdout and rc == 0, stdout
         assert "Traceback" not in stdout, stdout
+    finally:
+        srv.close()
+
+
+def _interact(conn):
+    conn.sendall(b"interact\r")
+    _expect(conn, "IPython on this frame", "In [1]:")
+
+
+def test_interact_is_an_ipython_shell_on_the_frame(target):
+    """A real IPython prompt over the pty: completion (echo-proof: the completed
+    name is never typed), output and Out[] at the listener, an assignment that
+    lands in the frame's locals, and Ctrl-D back to the ipdb> prompt."""
+    srv = _listener()
+    proc = target(srv.getsockname()[1])
+    try:
+        conn = _attach(srv)
+        _interact(conn)
+        conn.sendall(b"threading.current_th\t")          # a module global of the frame
+        _expect(conn, "current_thread")
+        conn.sendall(b"\x15")                            # Ctrl-U: clear the line
+        time.sleep(0.3)
+        conn.sendall(b"x = 41 + 1\r")
+        _expect(conn, "In [2]:")
+        conn.sendall(b"print(x * 2)\r")
+        _expect(conn, "84", "In [3]:")
+        conn.sendall(b"x\r")
+        _expect(conn, "Out[3]: 42", "In [4]:")
+        conn.sendall(b"\x04")                            # Ctrl-D: leave the shell
+        _expect(conn, "back to ipdb>", "ipdb>")
+        conn.sendall(b"p x\r")
+        _expect(conn, "42", "ipdb>")                      # the assignment reached the frame
+        conn.sendall(b"detach\r")
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED" in stdout and rc == 0, stdout
+    finally:
+        srv.close()
+
+
+def test_interact_cell_is_interrupted_by_ctrl_c(target):
+    srv = _listener()
+    proc = target(srv.getsockname()[1])
+    try:
+        conn = _attach(srv)
+        _interact(conn)
+        conn.sendall(b"busy(30)\r")
+        time.sleep(0.5)
+        conn.sendall(b"\x03")
+        _expect(conn, "KeyboardInterrupt", "In [2]:")    # back at the shell's prompt
+        conn.sendall(b"\x04")
+        _expect(conn, "ipdb>")
+        conn.sendall(b"detach\r")
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED" in stdout and rc == 0, stdout
+    finally:
+        srv.close()
+
+
+def test_listener_hang_up_in_interact_releases_the_target(target):
+    """The shell's prompt is a different prompt_toolkit session than the
+    debugger's: a hang-up must end it too, or the target stays paused."""
+    srv = _listener()
+    proc = target(srv.getsockname()[1])
+    try:
+        conn = _attach(srv)
+        _interact(conn)
+        start = time.time()
+        conn.shutdown(socket.SHUT_RDWR)
+        conn.close()
+        conn2 = _attach(srv)                 # it ran on to its second set_trace
+        assert time.time() - start < 5
+        conn2.shutdown(socket.SHUT_RDWR)
+        conn2.close()
+        stdout, rc = _finish(proc, srv)
+        assert "RESUMED AGAIN" in stdout and rc == 0, stdout
     finally:
         srv.close()

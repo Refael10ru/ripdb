@@ -70,6 +70,18 @@ Guarantees callers rely on — **do not break these**:
   them or in pdb's prompt loop, which catches it. While the program runs it
   only calls `set_step()`. Other debugger commands ignore it. Never install a
   SIGINT handler in the target, and never raise into the program's own code.
+- **`interact` is a real IPython shell, over the same pty.** IPython's own
+  `do_interact` embeds a shell on the *process's* stdio — not the listener,
+  and in a container not a terminal at all. `ReverseIPdb.do_interact` runs a
+  `_FrameShell` instead: its prompt_toolkit session takes the debugger's pty
+  input/output, its prompts run in the debugger's prompt thread through
+  `_guarded_prompt` (so a listener hang-up ends them exactly like the
+  debugger's own prompt), its cells run under `_evaluating` (so Ctrl-C
+  interrupts them like `p` / `!`), and `sys.std{in,out,err}` are the pty
+  for the duration — what pdb itself does around evaluated code. The embed's
+  main loop writes the shell's namespace back into the frame's locals on
+  exit. `confirm_exit` is off: an EOF must leave at once, nothing can answer
+  a question after a hang-up.
 - **POSIX only.** A pty is required, so the package imports `termios` at the
   top level — `import reverse_ipdb` only works on a Unix platform.
 
@@ -239,6 +251,10 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   target — at its prompt, mid-command (output still flowing) and between
   breakpoints; and Ctrl-C interrupting a command (main and worker thread, with
   the "pending" note for a blocking call) or stopping the running program.
+  And `interact`: an echo-proof completion in the IPython shell, output and
+  `Out[]` at the listener, an assignment landing in the frame, Ctrl-C
+  interrupting a cell, Ctrl-D back to `ipdb>`, and a listener hang-up at the
+  shell's prompt releasing the target.
 - `tests/test_api.py` — hand-off to `client.attach` and aliasing.
 - `tests/test_layers.py` — the import graph matches `docs/api-layers.md`.
 - `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,

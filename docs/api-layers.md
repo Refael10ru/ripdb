@@ -115,6 +115,10 @@ The interactive behaviour, and the byte pipe that carries it.
   breakpoint is set) to **detach and
   continue** (via that teardown hook) instead of raising `BdbQuit` into the
   program.
+- `interact` — `_FrameShell`, an embedded IPython whose prompt_toolkit
+  application is bound to the same pty: prompts go through the debugger's
+  guarded prompt (so a hang-up ends them), cells through its Ctrl-C
+  bookkeeping, and the process's stdio is the pty while it runs.
 
 `pty_bridge` is the only code that touches the raw socket and the pty fds.
 
