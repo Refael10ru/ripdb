@@ -173,6 +173,7 @@ your program.**
 | `c` (continue)      | resume; the session stays open for your breakpoints. With **no** breakpoints set it detaches, since nothing could bring the prompt back |
 | Ctrl-C              | at the prompt: clear the line. During a command that runs code (`!time.sleep(60)`, `p slow()`): interrupt it, back to the prompt. While the program runs (after `n`, `c`...): stop at the next line it runs. It never raises into the program itself |
 | Ctrl-]              | handled by the listener: drop this session (the target detaches and runs on); see above |
+| `interact`          | a **full IPython shell on the current frame** — completion, history, magics — over this same connection. Assignments you make there land in the frame. Ctrl-D or `exit` returns to `ipdb>` |
 
 Ctrl-C reaches the target as a keystroke, not as a signal to the process, so
 the program's own SIGINT handler is never involved. Outside the main thread,
