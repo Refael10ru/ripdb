@@ -98,6 +98,18 @@ Guarantees callers rely on — **do not break these**:
   breakpoint in such a worker could never prompt and detached at once.
   `ReverseIPdb` swaps in `_PromptThread`, one daemon thread per prompt, which
   has no such check. `tests/test_session.py` pins both cases.
+- **`interact` is a real IPython shell, over the same pty.** IPython's own
+  `do_interact` embeds a shell on the *process's* stdio — not the listener,
+  and in a container not a terminal at all. `ReverseIPdb.do_interact` runs a
+  `_FrameShell` instead: its prompt_toolkit application is bound to the
+  debugger's pty input/output, its prompts run on the debugger's prompt
+  thread through `_guarded_prompt` (so a listener hang-up ends them exactly
+  like the debugger's own prompt), its cells run under `_evaluating` (so
+  Ctrl-C interrupts them like `p` / `!`), and `sys.std{in,out,err}` are the
+  pty for the duration — what pdb itself does around evaluated code. The
+  embed's main loop writes the shell's namespace back into the frame's locals
+  on exit. `confirm_exit` is off: an EOF must leave at once, nothing can
+  answer a question after a hang-up.
 - **POSIX only.** A pty is required, so the package imports `termios` at the
   top level — `import reverse_ipdb` only works on a Unix platform.
 
@@ -276,6 +288,10 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   the "pending" note for a blocking call) or stopping the running program;
   and a breakpoint in a worker thread after the main thread has finished (or
   with the shutdown flag inherited by a fork) still getting a working prompt.
+  And `interact`: an echo-proof completion in the IPython shell, output and
+  `Out[]` at the listener, an assignment landing in the frame, Ctrl-C
+  interrupting a cell, Ctrl-D back to `ipdb>`, and a listener hang-up at the
+  shell's prompt releasing the target.
 - `tests/test_lifecycle.py` — one process through hundreds of no-listener and
   turned-away breakpoints and ten sessions ending every way: no fds, threads,
   debuggers or prompt sessions left, the stopped frame's 1 MiB local freed
