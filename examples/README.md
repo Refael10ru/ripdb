@@ -30,7 +30,7 @@ Terminal 1:
 
 ```sh
 uv run reverse_ipdb-serve
-# *** reverse_ipdb listening on 0.0.0.0:4444 (one-shot) — Ctrl-C to quit
+# *** reverse_ipdb listening on 0.0.0.0:4444 (no queue, 1s cooldown, one-shot) — Ctrl-C to quit; while attached, Ctrl-] drops the session (twice: quit)
 ```
 
 Terminal 2:

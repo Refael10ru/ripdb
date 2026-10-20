@@ -17,9 +17,9 @@ code both ends share is `protocol.py`, the wire format of the handshake.
  │        │                           │   fail-open, single-shell lock,
  │        │                           │   per-thread cooldown after "continue"
  │        ▼                           │
- │ 3. Debugger+pty    pty_bridge.py   │   handshake, then IPython on a pty;
- │                    debugger.py     │   pumps bytes to the socket; detach
- └────────┼──────────────────────────┘   tears down
+ │ 3. Debugger+pty    pty_bridge.py   │   IPython on a pty; pumps bytes to
+ │                    debugger.py     │   the socket; detach or a hang-up
+ └────────┼──────────────────────────┘   tears it all down
           │  TCP: one JSON line each way,          ┌────────────────────────┐
           │  then a raw vt100 terminal            │  Listener   serve.py   │
           └───────────────────────────────────────│  the peer: answers the │
@@ -101,11 +101,14 @@ The interactive behaviour, and the byte pipe that carries it.
   closes the master), then calls Layer 2's `release`, which **shuts down** and
   closes the socket and frees the shell lock. The `shutdown` matters: a bare `close()` while the other pump is
   blocked in `recv` sends no FIN, and the listener would never see the detach.
-- A **listener hang-up** calls `ReverseIPdb.hang_up()`, which ends the prompt
-  (now, or the next one to start) as if Ctrl-D were pressed, so the target
-  detaches and runs on instead of staying paused. Until it does, the output
-  pump discards whatever the debugger writes, so a dead connection never
-  blocks or raises into the program.
+- A **listener hang-up** calls `ReverseIPdb.hang_up()`. It ends the prompt
+  as if Ctrl-D were pressed, either now or after a running command, so the
+  target detaches and runs on instead of staying paused, and no new stop
+  begins. If the debugger is idle, the pty and prompt thread are retired at
+  once. Until the debugged thread lets go, the output pump discards whatever
+  the debugger writes, so a dead connection never blocks or raises into the
+  program. `ReverseIPdb._release` then unhooks the program's frames and drops
+  every reference to them (see `docs/lifecycles.md`).
 - `ReverseIPdb.interrupt()` — the socket->pty pump hands it each Ctrl-C byte
   (no SIGINT exists for a pty that isn't the controlling terminal). During a
   command that evaluates code it raises `KeyboardInterrupt` in that command;

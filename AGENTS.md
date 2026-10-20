@@ -96,13 +96,15 @@ uv run reverse_ipdb-serve --keep          # one shell at a time, the others cont
 uv run reverse_ipdb-serve --keep --cooldown 5  # …and stay away 5s before dialing again (default 1)
 uv run reverse_ipdb-serve --keep --queue  # queue: everyone waits, walk them in arrival order
 python -m reverse_ipdb.serve --keep       # same, without uv
-socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
+socat STDIO,raw,echo=0,escape=0x1d TCP-LISTEN:4444,reuseaddr   # minimal, one session; Ctrl-] ends it
 ```
 
 `reverse_ipdb-serve` accepts every container immediately, shows a live roster
 (`queued:` / `attached:` / `detached:`), and puts your terminal in raw mode so
-completion works. Use a **raw** listener — `nc` mangles completion
-(line-buffered + local echo).
+completion works. Use a **raw** listener. `nc -l` still gets a working prompt:
+commands and `detach` work, and Ctrl-C ends nc and releases the target. But nc
+is line-buffered with local echo, so there is no completion, lines show
+twice, and Ctrl-C can't interrupt the target.
 
 **Default — no queue.** While one container holds the slot (about to attach,
 or attached), every other arrival is answered `continue` and runs on as if no

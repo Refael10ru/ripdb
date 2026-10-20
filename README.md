@@ -1,6 +1,6 @@
 # reverse_ipdb — reverse-connecting pdb
 
-[![CI](https://github.com/Refael10ru/reverse_ipdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Refael10ru/reverse_ipdb/actions/workflows/ci.yml)
+[![CI](https://github.com/Refael10ru/ripdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Refael10ru/ripdb/actions/workflows/ci.yml)
 
 Debugging a process that has no terminal — a container, a daemon, a CI worker — is
 awkward: you can't attach a shell to something that isn't reading from one. `reverse_ipdb`
@@ -12,11 +12,11 @@ to a listener you run and hands you an IPython shell (with completion) over the 
 > the dev/CI workflow.
 
 ```
-┌──────────────────────────┐        TCP connect() OUT        ┌──────────────────────────┐
-│  TARGET PROCESS           │ ──────────────────────────────►│  YOUR MACHINE            │
-│  import reverse_ipdb             │                                 │  python -m reverse_ipdb.serve   │
-│  reverse_ipdb.set_trace()        │ ◄────── IPython over socket ───►│  (gives you the shell)   │
-└──────────────────────────┘                                 └──────────────────────────┘
+┌───────────────────────────┐      TCP connect() OUT      ┌───────────────────────────┐
+│  TARGET PROCESS           │ ──────────────────────────► │  YOUR MACHINE             │
+│  import reverse_ipdb      │                             │  reverse_ipdb-serve       │
+│  reverse_ipdb.set_trace() │ ◄─── IPython over socket ──►│  (gives you the shell)    │
+└───────────────────────────┘                             └───────────────────────────┘
 ```
 
 If nobody is listening, `set_trace()` is a **no-op** and the program runs on untouched.
@@ -26,9 +26,9 @@ If nobody is listening, `set_trace()` is a **no-op** and the program runs on unt
 This project is managed with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uv sync                   # create the venv and install deps (incl. dev tools)
-uv run reverse_ipdb-serve        # run the listener
-uv run python -m reverse_ipdb ...# or run anything inside the environment
+uv sync                        # create the venv and install deps (incl. dev tools)
+uv run reverse_ipdb-serve      # run the listener
+uv run python your_script.py   # run anything inside the environment
 ```
 
 Prefer plain pip? `pip install -e .` still works (the dev tools live in the
@@ -80,13 +80,20 @@ uv run reverse_ipdb-serve --port 4444   # pick the port
 # (or: python -m reverse_ipdb.serve, once the package is installed)
 ```
 
-…or a plain `socat` (single session, no roster) — use raw mode so completion
-and keys pass through:
+…or a plain socket tool, for a single session with no roster. `socat` in raw
+mode gives the full experience. `escape=0x1d` makes Ctrl-] end the session,
+as it does in the bundled listener:
 
 ```sh
-socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr
-# nc works too but mangles completion (line-buffered, local echo)
+socat STDIO,raw,echo=0,escape=0x1d TCP-LISTEN:4444,reuseaddr
 ```
+
+`nc -l 4444` also works for a quick look. Commands, `detach`, and Ctrl-C all
+behave: Ctrl-C ends nc and the target runs on. But nc is line-buffered and
+echoes locally, so tab completion doesn't work, every line shows twice, the
+target's JSON banner line is printed first, and Ctrl-C can't interrupt a
+command on the target. With either tool, the target waits half a second for
+the size reply that `reverse_ipdb-serve` would send, then uses 80×24.
 
 ### Many containers
 
@@ -202,7 +209,8 @@ This is deliberate: a stray `q` over a flaky debugging link should never raise
   allocation is and when it is freed: [docs/lifecycles.md](docs/lifecycles.md).
 - **Leaving is immediate, from either end.** The moment you detach, the target
   hangs up (a `shutdown`, not just a `close`, so the listener sees it even while
-  the program keeps running) and the next queued container comes up. When the
+  the program keeps running) and the listener moves on to the next breakpoint,
+  or the next queued container with `--queue`. When the
   listener hangs up instead (a drop, or quitting), the target leaves its prompt
   as if you'd typed Ctrl-D and runs on; it never stays paused for a listener
   that's gone. TCP keepalive on both ends means a container that vanishes
@@ -231,9 +239,10 @@ For how these modules stack into layers and which guarantee each one owns, see
 reverse_ipdb/
   __init__.py    public API re-exports (set_trace, set_trace_ipython, docker_set_trace)
   api.py         the entry points
-  client.py      target side: resolve host/port, dial out, single-shell lock
+  client.py      target side: resolve host/port, dial out, handshake, single-shell lock, cooldown
   debugger.py    ReverseIPdb (IPython TerminalPdb) + detach-on-quit mixin
   pty_bridge.py  IPython-over-pty launcher so prompt_toolkit completion works
+  protocol.py    the handshake wire format, shared by target and listener
   serve.py       the listener: python -m reverse_ipdb.serve
 examples/        runnable scripts for trying it locally (see examples/README.md)
 tests/           pytest suite (unit + end-to-end over a real socket)
