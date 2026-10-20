@@ -2,7 +2,8 @@
 
 Orientation for an agent (or human) picking this up. For usage prose see
 [README.md](README.md); for the completion internals see
-[docs/completion.md](docs/completion.md) and [docs/api-layers.md](docs/api-layers.md).
+[docs/completion.md](docs/completion.md) and [docs/api-layers.md](docs/api-layers.md); for
+what is allocated and when it is freed, [docs/lifecycles.md](docs/lifecycles.md).
 
 ## What it is
 
@@ -53,12 +54,16 @@ Guarantees callers rely on — **do not break these**:
   `tests/test_session.py` pins it.
 - **A listener hang-up releases the target.** Closing fds under a blocked
   prompt never wakes it, so when the socket dies the bridge calls
-  `ReverseIPdb.hang_up()`: it ends the running prompt with `EOFError` (via the
-  prompt's own event loop) or, if none is up, the next one as soon as it
-  starts — the debugger takes that as `detach`. Until then the pty->socket
-  pump keeps reading and discarding, so the debugger's writes (a command's
-  output, the stack at the next breakpoint) neither block nor fail into the
-  program. Only the output pump closes the master, once the slave is closed.
+  `ReverseIPdb.hang_up()`. It ends the running prompt with `EOFError` (via
+  the prompt's own event loop), or the next one as soon as it starts (after
+  a running command); the debugger takes that as `detach`. **No new stop
+  begins after a hang-up**: `interaction` checks under the same lock. If the
+  debugger is idle — not in a stop and not inside `trace_dispatch`, where pdb
+  may print `--Return--` before a stop — the bridge retires the pty and the
+  prompt thread at once. Otherwise the pty->socket pump keeps reading and
+  discarding until the debugged thread lets go, so the debugger's writes
+  neither block nor fail into the program. Only the output pump closes the
+  master, once the slave is closed.
 - **Ctrl-C without signals, never into the program.** The pty is nobody's
   controlling terminal, so a `\x03` from the listener raises no SIGINT; the
   socket->pty pump hands it to `ReverseIPdb.interrupt()`. At the prompt it
@@ -70,6 +75,17 @@ Guarantees callers rely on — **do not break these**:
   them or in pdb's prompt loop, which catches it. While the program runs it
   only calls `set_step()`. Other debugger commands ignore it. Never install a
   SIGINT handler in the target, and never raise into the program's own code.
+- **Nothing outlives a session.** After detach or any hang-up, the stopped
+  frame and its locals are freed at once, by reference counting. The
+  debugger object itself sits in IPython/prompt_toolkit reference cycles
+  (about 820 KiB) and goes at the next GC pass. `ReverseIPdb._release`
+  unhooks every frame on the stack (bdb leaves `botframe` hooked), drops
+  frame refs and the completer's namespaces, clears only its own breakpoints
+  (bdb's registry is process-wide), and closes IPython's unused `pt_loop`. End-of-file becomes `"EOF"` inside the
+  prompt thread, so no traceback carries frames across threads. A hang-up that
+  finds the debugger idle retires the pty and threads at once. Every allocation
+  is listed with its release in `tests/test_lifecycle_static.py`; see
+  `docs/lifecycles.md`.
 - **POSIX only.** A pty is required, so the package imports `termios` at the
   top level — `import reverse_ipdb` only works on a Unix platform.
 
@@ -80,13 +96,15 @@ uv run reverse_ipdb-serve --keep          # one shell at a time, the others cont
 uv run reverse_ipdb-serve --keep --cooldown 5  # …and stay away 5s before dialing again (default 1)
 uv run reverse_ipdb-serve --keep --queue  # queue: everyone waits, walk them in arrival order
 python -m reverse_ipdb.serve --keep       # same, without uv
-socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr   # minimal, single session
+socat STDIO,raw,echo=0,escape=0x1d TCP-LISTEN:4444,reuseaddr   # minimal, one session; Ctrl-] ends it
 ```
 
 `reverse_ipdb-serve` accepts every container immediately, shows a live roster
 (`queued:` / `attached:` / `detached:`), and puts your terminal in raw mode so
-completion works. Use a **raw** listener — `nc` mangles completion
-(line-buffered + local echo).
+completion works. Use a **raw** listener. `nc -l` still gets a working prompt:
+commands and `detach` work, and Ctrl-C ends nc and releases the target. But nc
+is line-buffered with local echo, so there is no completion, lines show
+twice, and Ctrl-C can't interrupt the target.
 
 **Default — no queue.** While one container holds the slot (about to attach,
 or attached), every other arrival is answered `continue` and runs on as if no
@@ -231,6 +249,17 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   target — at its prompt, mid-command (output still flowing) and between
   breakpoints; and Ctrl-C interrupting a command (main and worker thread, with
   the "pending" note for a blocking call) or stopping the running program.
+- `tests/test_lifecycle.py` — one process through hundreds of no-listener and
+  turned-away breakpoints and ten sessions ending every way: no fds, threads,
+  debuggers or prompt sessions left, the stopped frame's 1 MiB local freed
+  without the GC, about 11 KiB per session left over (prompt_toolkit); and a
+  hang-up while the program is blocked releases the session at once.
+- `tests/test_release.py` — a hang-up that lands inside `trace_dispatch` is
+  not idle (the pty stays until the debugged thread lets go), and a debugger
+  clears only the breakpoints it created.
+- `tests/test_lifecycle_static.py` — every resource-creating call has a
+  documented release (`LIFECYCLES`), every thread is a daemon, and every
+  module-level state is accounted for (`MODULE_STATE`).
 - `tests/test_api.py` — hand-off to `client.attach` and aliasing.
 - `tests/test_layers.py` — the import graph matches `docs/api-layers.md`.
 - `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,

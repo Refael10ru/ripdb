@@ -19,9 +19,11 @@ arranges that by giving the **target** a pseudo-terminal:
 
 Requirements:
 
-- **Use a raw listener.** `reverse_ipdb-serve` does this automatically. With a plain
-  socket tool use `socat STDIO,raw,echo=0 TCP-LISTEN:4444,reuseaddr` — **not**
-  `nc` (line-buffered + local echo mangle completion).
+- **Use a raw listener.** `reverse_ipdb-serve` does this automatically. With a
+  plain socket tool use `socat STDIO,raw,echo=0,escape=0x1d TCP-LISTEN:4444,reuseaddr`
+  (Ctrl-] ends the session). `nc` gets you a working prompt but **no
+  completion**: it sends whole lines, so `ord<TAB><Enter>` arrives at once and
+  the unexpanded `ord` is what runs. Its local echo also doubles every line.
 - **POSIX target.** The pty uses `pty`/`termios`, which the package imports at
   the top level, so `import reverse_ipdb` requires a Unix platform.
 
@@ -29,10 +31,11 @@ That's it — there's nothing to turn on.
 
 ## This works *across many containers*
 
-Completion composes with the fan-in model: point every container at one
-`reverse_ipdb-serve --keep`, and each paused container gives you a full
-completion-enabled IPython shell as you walk the roster. You never connect
-*to* the containers.
+Completion composes with the fan-in model. Point every container at one
+`reverse_ipdb-serve --keep`, and each breakpoint that gets the shell gives you
+a full completion-enabled IPython shell. By default that's one at a time,
+while the others continue. With `--queue`, the containers wait, paused, and
+you walk them from the roster. You never connect *to* the containers.
 
 ## Aside: madbg (a forward alternative)
 
