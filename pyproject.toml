@@ -7,11 +7,14 @@ name = "reverse_ipdb"
 version = "0.1.0"
 description = "Reverse-connecting pdb: reverse_ipdb.set_trace() dials out to a listener you run."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 keywords = ["pdb", "ipdb", "debugger", "remote", "reverse", "docker"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Debuggers",
     "Intended Audience :: Developers",
 ]
