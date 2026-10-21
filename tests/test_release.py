@@ -5,9 +5,12 @@
   stop even begins, so the pty must not be closed under it.
 - A debugger clears only the breakpoints it created: bdb's registry is
   process-wide, and another session may be using it.
+- A failure inside a stop (the prompt machinery, a command) detaches and is
+  reported; it never raises into the debugged program.
 """
 
 import bdb
+import sys
 
 from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
@@ -55,3 +58,27 @@ def test_a_debugger_clears_only_its_own_breakpoints():
     finally:
         theirs._clear_own_breaks()
     assert (here, line + 1) not in bdb.Breakpoint.bplist
+
+
+def test_a_failure_inside_the_stop_detaches_instead_of_raising(monkeypatch, capsys):
+    """What a broken prompt (or anything else under interaction) must do:
+    report, detach, and let the program run on — never raise through
+    trace_dispatch into the program."""
+    dbg = _debugger()
+
+    def broken_cmdloop(self, intro=None):
+        raise RuntimeError("the prompt machinery blew up")
+
+    monkeypatch.setattr(type(dbg), "cmdloop", broken_cmdloop)
+    closed = []
+    dbg._reverse_ipdb_close = lambda: closed.append(True)
+
+    def program():
+        dbg.set_trace()
+        return "ran on"                      # reached only if nothing raised
+
+    assert program() == "ran on"
+    assert sys.gettrace() is None
+    assert dbg._reverse_ipdb_detached and closed      # closed (the hook is idempotent)
+    err = capsys.readouterr().err
+    assert "the debugger failed, detaching" in err and "RuntimeError" in err

@@ -25,6 +25,7 @@ import functools
 import signal
 import sys
 import threading
+import traceback
 
 from IPython.terminal.debugger import TerminalPdb
 
@@ -169,8 +170,29 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         self._reverse_ipdb_stopping = False
         try:
             return super().interaction(frame, tb_or_exc)
+        except Exception:
+            # Whatever broke inside the stop — the prompt machinery, a command,
+            # IPython itself — is this session's failure, not the program's:
+            # it would otherwise travel up through trace_dispatch into the
+            # debugged code. Say what happened on both ends, then detach.
+            self._fail(traceback.format_exc())
+            return None
         finally:
             self._reverse_ipdb_state = RUNNING
+
+    def _fail(self, text):
+        """Report a failure inside the debugger and leave the program alone."""
+        text = f"*** reverse_ipdb: the debugger failed, detaching:\n{text}"
+        with contextlib.suppress(Exception):
+            sys.stderr.write(text)
+        with contextlib.suppress(Exception):
+            self.stdout.write(text)  # the listener, if the pty is still up
+        try:
+            self.do_detach("")
+        except Exception:  # even detaching failed: at least stop tracing
+            self._reverse_ipdb_detached = True
+            with contextlib.suppress(Exception):
+                self.set_continue()
 
     def interrupt(self):
         """A Ctrl-C byte arrived from the listener (called by the socket pump).
@@ -335,6 +357,14 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         for name in ("tb_lineno", "displaying", "_skip_cache", "_parent_skip_cache"):
             with contextlib.suppress(AttributeError):
                 getattr(self, name).clear()
+        # IPython 8 (Python 3.10) keeps its frame-skip predicates in class-level
+        # lru_caches keyed on (debugger, frame): this debugger and the stopped
+        # frame would live on in them. IPython 9 moved them onto the instance
+        # (cleared just above). They are caches shared by every debugger, so
+        # emptying them costs the others a recomputation and nothing else.
+        for name in ("_cachable_skip", "_cached_one_parent_frame_debuggerskip"):
+            with contextlib.suppress(AttributeError):
+                getattr(type(self), name).cache_clear()
         self._close_pt_loop()
 
     def _close_pt_loop(self):

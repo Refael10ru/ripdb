@@ -30,6 +30,7 @@ traced memory.
 | "KeyboardInterrupt pending" timer | `ReverseIPdb.interrupt` | one-shot daemon, ends after 1 s |
 | trace hooks on the debugged thread's frames and `sys.settrace` | bdb | `ReverseIPdb._release` at the first trace event after the session |
 | breakpoints in bdb's process-wide registry | bdb | cleared on detach and in `_release` |
+| IPython 8's class-level `lru_cache`s of the frame-skip predicates, keyed on (debugger, frame) | IPython 8 (IPython 9 keeps them per instance) | emptied in `_release` |
 | the stopped frame and its locals | — | freed by reference counting as soon as the program is done with them |
 | the debugger object and its prompt session (about 820 KiB) | — | unreachable once the program resumes; in IPython/prompt_toolkit reference cycles, so freed at the next GC pass |
 

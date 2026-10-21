@@ -37,7 +37,11 @@ Guarantees callers rely on — **do not break these**:
   program runs on untouched. Never raise into the debugged program. That holds
   after dialing too: if the deferred IPython import fails (a broken venv, say),
   `pty_bridge._abort` prints the traceback to stderr *and* to the listener,
-  closes the socket, releases the lock, and the program runs on.
+  closes the socket, releases the lock, and the program runs on. And inside a
+  stop: whatever breaks under `interaction` (the prompt machinery, a command,
+  IPython itself) is caught by `ReverseIPdb.interaction`, reported on stderr
+  and to the listener, and turned into a detach — it never travels up through
+  `trace_dispatch` into the debugged code. `tests/test_release.py` pins it.
 - **One shell at a time.** A module-level lock means the first thread/process to
   reach a breakpoint gets the shell; concurrent arrivals no-op. Released when
   the session's socket/pty closes.
@@ -193,8 +197,13 @@ uv run mypy             # types
 uv run pytest -q        # tests
 ```
 
-CI (`.github/workflows/ci.yml`) runs all three on push/PR for Python 3.11–3.12.
-Keep the gate green.
+CI (`.github/workflows/ci.yml`) runs all three on push/PR for Python 3.10–3.12.
+Keep the gate green. **3.10 matters:** it is where production runs, and it
+resolves **IPython 8** (IPython 9 needs 3.11+), so both IPython lines must
+keep working. Known IPython 8 difference: its frame-skip predicates live in
+class-level `lru_cache`s keyed on `(debugger, frame)`; `_release` empties
+them, or the debugger and the stopped frame live on. Run the suite under
+both before touching `debugger.py`: `uv run --python 3.10 pytest -q`.
 
 Ruff enforces **PLC0415** (imports at the top of the file). The one deliberate
 exception is in `pty_bridge.run`, marked `# noqa: PLC0415`: IPython /
