@@ -11,6 +11,7 @@
 
 import bdb
 import sys
+import types
 
 from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
@@ -34,13 +35,13 @@ def test_hang_up_inside_trace_dispatch_is_not_idle(monkeypatch):
     monkeypatch.setattr(bdb.Bdb, "trace_dispatch", dispatch)
     dbg.trace_dispatch(None, "return", None)
     assert seen == {"idle": False}                  # the pty stays for the debugged thread
-    assert not dbg._reverse_ipdb_dispatching
+    assert not dbg._rv.dispatching
 
 
 def test_hang_up_between_events_is_idle():
     dbg = _debugger()
     assert dbg.hang_up() is True                    # not stopped, not dispatching
-    assert dbg._reverse_ipdb_detached
+    assert dbg._rv.detached
 
 
 def test_a_debugger_clears_only_its_own_breakpoints():
@@ -51,12 +52,12 @@ def test_a_debugger_clears_only_its_own_breakpoints():
     assert theirs.set_break(here, line + 1) is None
     theirs_bp = bdb.Breakpoint.bplist[here, line + 1][-1]
     try:
-        mine._clear_own_breaks()
+        mine._clear_breaks()
         assert (here, line) not in bdb.Breakpoint.bplist
         assert bdb.Breakpoint.bpbynumber[theirs_bp.number] is theirs_bp  # untouched
-        mine._clear_own_breaks()                    # idempotent
+        mine._clear_breaks()                        # idempotent
     finally:
-        theirs._clear_own_breaks()
+        theirs._clear_breaks()
     assert (here, line + 1) not in bdb.Breakpoint.bplist
 
 
@@ -71,7 +72,7 @@ def test_a_failure_inside_the_stop_detaches_instead_of_raising(monkeypatch, caps
 
     monkeypatch.setattr(type(dbg), "cmdloop", broken_cmdloop)
     closed = []
-    dbg._reverse_ipdb_close = lambda: closed.append(True)
+    dbg._rv.bridge = types.SimpleNamespace(close=lambda: closed.append(True))
 
     def program():
         dbg.set_trace()
@@ -79,6 +80,6 @@ def test_a_failure_inside_the_stop_detaches_instead_of_raising(monkeypatch, caps
 
     assert program() == "ran on"
     assert sys.gettrace() is None
-    assert dbg._reverse_ipdb_detached and closed      # closed (the hook is idempotent)
+    assert dbg._rv.detached and closed               # the bridge was closed
     err = capsys.readouterr().err
     assert "the debugger failed, detaching" in err and "RuntimeError" in err

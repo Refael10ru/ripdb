@@ -114,12 +114,17 @@ The interactive behaviour, and the byte pipe that carries it.
   command that evaluates code it raises `KeyboardInterrupt` in that command;
   while the program runs it stops at the next line; at the prompt the byte
   passes on and clears the line. It never raises into the program's own code.
-- `DetachMixin` — redefines `q` / `quit` / `exit` / EOF (and `c` when no
-  breakpoint is set) to **detach and
-  continue** (via that teardown hook) instead of raising `BdbQuit` into the
-  program.
+- `ReverseIPdb.do_detach` — `q` / `quit` / `exit` / EOF (and `c` when no
+  breakpoint is set) **detach and continue** (closing the `Bridge`) instead
+  of raising `BdbQuit` into the program.
+- Its session state is one `_Session` object (`dbg._rv`), and where the
+  debugged thread is — running, stopped, at the prompt, evaluating code — is
+  a `State` enum, which the pump threads read to decide what Ctrl-C and a
+  hang-up mean.
 
-`pty_bridge` is the only code that touches the raw socket and the pty fds.
+`pty_bridge.Bridge` is the only code that touches the raw socket and the pty
+fds: it owns the pty, the two pumps and the teardown (`Bridge.close`), and
+the debugger holds a reference to it.
 
 ---
 
@@ -135,6 +140,10 @@ remove them).
   isn't a JSON object (garbage, silence, a hang-up) decodes to `{}`.
 - `read_line(sock)` — reads byte-at-a-time so nothing past the line is
   consumed: the bytes after it belong to the vt100 session.
+- `Field` — the keys, as a `str` enum (`Field.CONTINUE`, `Field.COLS`, ...);
+  both ends build and read messages through it, never through bare strings.
+- `keep_alive(sock)` / `hang_up(sock)` — the socket habits both ends share:
+  TCP keepalive, and `shutdown` before `close`.
 
 ```
 target   -> {"reverse_ipdb": "pty", "host": .., "pid": .., "thread": ..}
@@ -148,7 +157,7 @@ After the reply the socket is a raw vt100 terminal until it closes.
 
 Not part of the target-side stack; it runs on **your** machine as the other
 end of the socket (`python -m reverse_ipdb.serve`, or a plain `socat`/`nc`). A
-background acceptor takes **every** connecting container at once, handing
+background acceptor (`_Listener.accept`) takes **every** connecting container at once, handing
 each to a short-lived handshake thread that reads its banner (with a timeout,
 so a silent client holds up nobody) and answers it *at once*, while the
 foreground serves sessions one at a time with a live roster (`--keep` to

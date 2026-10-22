@@ -35,15 +35,15 @@ LIFECYCLES = {
     ("client", "dial", "socket.create_connection"):
         "release() returned by dial: shutdown + close, exactly once, when the "
         "session ends however it ends (continue reply, hang-up, detach, abort)",
-    ("pty_bridge", "run", "os.openpty"):
-        "master: closed once by the pty->socket pump when it ends (slave closed). "
-        "slave: wrapped by slave_in, closed by close() from the debugging thread, "
-        "or from the pump when a hang-up finds the debugger idle",
-    ("pty_bridge", "run", "os.fdopen"):
-        "slave_in / slave_out: same as the slave fd (close_slave)",
-    ("pty_bridge", "run", "os.dup"):
-        "the slave dup behind slave_out: close_slave",
-    ("pty_bridge", "run", "threading.Thread"):
+    ("pty_bridge", "__init__", "os.openpty"):
+        "master: closed once by the output pump when it ends (slave closed). "
+        "slave: wrapped by slave_in, closed by Bridge.close() from the debugged "
+        "thread, or from a pump when a hang-up finds the debugger idle",
+    ("pty_bridge", "__init__", "os.fdopen"):
+        "slave_in / slave_out: same as the slave fd (Bridge._retire_slave)",
+    ("pty_bridge", "__init__", "os.dup"):
+        "the slave dup behind slave_out: Bridge._retire_slave",
+    ("pty_bridge", "__init__", "threading.Thread"):
         "output pump: ends on EIO once the slave is closed, then closes the master. "
         "input pump: ends when release() shuts the socket down",
     ("debugger", "submit", "threading.Thread"):
@@ -61,12 +61,12 @@ LIFECYCLES = {
     # --- the listener (your machine) -------------------------------------------
     ("serve", "serve", "socket.socket"):
         "the listening socket: `with` block; shutdown() wakes accept() on exit",
-    ("serve", "acceptor", "*.accept"):
+    ("serve", "accept", "*.accept"):
         "each connection is in `held` until release(): on detach, drop, stall, "
         "banner timeout, continue reply, or listener exit",
-    ("serve", "acceptor", "threading.Thread"):
+    ("serve", "accept", "threading.Thread"):
         "handshake thread: ends after one banner (bounded by BANNER_TIMEOUT)",
-    ("serve", "serve", "threading.Thread"):
+    ("serve", "run", "threading.Thread"):
         "acceptor: ends when listener.shutdown() fails accept(); joined on exit",
 }
 
@@ -81,14 +81,11 @@ THREAD_CALLS = {"threading.Thread", "threading.Timer"}
 # Created inside IPython / prompt_toolkit for each debugger, so invisible to the
 # scan above; we own their release. Each must keep a release call in the code.
 THIRD_PARTY = {
-    ("pty_bridge", "dbg.thread_executor.shutdown"):
-        "the prompt runner when the session ends (a no-op for _PromptThread, whose "
-        "threads end with their prompts; kept so a real executor would be retired)",
     ("debugger", "self.thread_executor.shutdown"):
         "TerminalPdb's own ThreadPoolExecutor, retired unused in __init__",
     ("debugger", "self.pt_loop.close"):
         "TerminalPdb's per-instance asyncio loop (unused, never closed by IPython)",
-    ("debugger", "self._clear_own_breaks"):
+    ("debugger", "self._clear_breaks"):
         "bdb's process-wide Breakpoint registry: only the entries this debugger created",
 }
 
@@ -158,13 +155,14 @@ def _is_daemon(call, parent, scope):
                for n in ast.walk(scope))
 
 
-# Calls at module/class level that build behaviour, not state.
-STATELESS_FACTORIES = {"_evaluates_code"}
+# Calls at module/class level that build behaviour, not state: a wrapped
+# command, or a dataclass field whose value is made per instance.
+STATELESS_FACTORIES = {"_evaluates_code", "dataclasses.field"}
 
 
 def _stateful_names(targets, value):
-    if isinstance(value, ast.Constant) or _is_constant_tuple(value):
-        return []          # immutable constants are not state
+    if isinstance(value, (ast.Constant, ast.JoinedStr)) or _is_constant_tuple(value):
+        return []          # immutable constants (an f-string too) are not state
     if isinstance(value, (ast.Lambda, ast.Name, ast.Attribute)):
         return []          # aliases (do_q = do_detach) and re-exports
     if isinstance(value, ast.Call) and _dotted(value.func) in STATELESS_FACTORIES:

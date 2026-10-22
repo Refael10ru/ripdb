@@ -13,6 +13,7 @@ objects, and whether the debugged frame's locals were freed:
 these resources is released.
 """
 
+import enum
 import json
 import os
 import socket
@@ -95,7 +96,17 @@ TARGET = textwrap.dedent(
     """
 )
 
-MODES = ["detach", "hangup_prompt", "c_nobreaks", "hangup_midcmd", "hangup_running"]
+class Ending(enum.Enum):
+    """How a session ends, cycled through by the driver."""
+
+    DETACH = enum.auto()          # `detach` at the prompt
+    HANGUP_PROMPT = enum.auto()   # the listener hangs up at the prompt
+    C_NOBREAKS = enum.auto()      # `c` with no breakpoints set
+    HANGUP_MIDCMD = enum.auto()   # the listener hangs up while a command runs
+    HANGUP_RUNNING = enum.auto()  # ... while the program runs between breakpoints
+
+
+MODES = list(Ending)
 TURNED_AWAY = 150
 SESSIONS = 2 * len(MODES)
 
@@ -131,16 +142,16 @@ def _drive(srv, script_path):
         conn.sendall(b"p len(payload.blob)\r")
         assert _recv_until(conn, "1048576")[1]
         mode = MODES[i % len(MODES)]
-        if mode == "detach":
+        if mode is Ending.DETACH:
             conn.sendall(b"detach\r")
             _drain_until_closed(conn)
-        elif mode == "c_nobreaks":
+        elif mode is Ending.C_NOBREAKS:
             conn.sendall(b"c\r")
             _drain_until_closed(conn)
-        elif mode == "hangup_midcmd":
+        elif mode is Ending.HANGUP_MIDCMD:
             conn.sendall(b"!__import__('time').sleep(0.3)\r")
             time.sleep(0.1)
-        elif mode == "hangup_running":
+        elif mode is Ending.HANGUP_RUNNING:
             conn.sendall(f"b {never}\r".encode())
             assert _recv_until(conn, "Breakpoint")[1]
             conn.sendall(b"c\r")
@@ -196,7 +207,7 @@ def test_nothing_outlives_a_breakpoint(tmp_path):
     assert first["threads"] == ["IPythonHistorySavingThread", "MainThread"], first
     # Freed by reference counting, without waiting for the cycle collector.
     assert all(r["freed_without_gc"] for r in sessions), \
-        [(MODES[r["i"] % len(MODES)], r["freed_without_gc"]) for r in sessions]
+        [(MODES[r["i"] % len(MODES)].name, r["freed_without_gc"]) for r in sessions]
     # What remains per session is prompt_toolkit's memo of every filter it ever
     # combined (a few KiB per PromptSession, upstream); nothing near the 1 MiB
     # local each stopped frame held.

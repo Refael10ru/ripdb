@@ -13,6 +13,7 @@ These tests drive a target subprocess over a raw socket, exactly as
 """
 
 import contextlib
+import enum
 import os
 import socket
 import subprocess
@@ -351,17 +352,26 @@ def test_ctrl_c_while_running_stops_at_the_next_line(target):
         srv.close()
 
 
+class Shutdown(enum.Enum):
+    """How the worker comes to see the interpreter shutting down (the value
+    goes to the target on its command line)."""
+
+    MAIN_RETURNED = "main_returned"    # the main thread has finished
+    INHERITED_FLAG = "inherited_flag"  # forked after that: the flag is inherited
+
+
 SHUTDOWN_TARGET = textwrap.dedent(
-    """
+    f"""
     import sys, threading, time
     from concurrent.futures import ThreadPoolExecutor   # loaded: registers its shutdown hook
     import reverse_ipdb
 
     PORT, HOW = int(sys.argv[1]), sys.argv[2]
+    MAIN_RETURNED = {Shutdown.MAIN_RETURNED.value!r}
 
     def parse():
         answer = 21
-        if HOW == "main_returned":
+        if HOW == MAIN_RETURNED:
             time.sleep(0.5)                  # by now the main thread has finished
         else:                                # a child forked after that point inherits this
             import concurrent.futures.thread
@@ -371,13 +381,13 @@ SHUTDOWN_TARGET = textwrap.dedent(
 
     worker = threading.Thread(target=parse)  # a plain, non-daemon worker
     worker.start()
-    if HOW != "main_returned":
+    if HOW != MAIN_RETURNED:
         worker.join()
     """
 )
 
 
-@pytest.mark.parametrize("how", ["main_returned", "inherited_flag"])
+@pytest.mark.parametrize("how", list(Shutdown))
 def test_breakpoint_after_the_interpreter_began_shutting_down(tmp_path, how):
     """concurrent.futures refuses new work once the main thread has finished
     (Python is waiting on non-daemon threads), and in children forked after
@@ -387,7 +397,7 @@ def test_breakpoint_after_the_interpreter_began_shutting_down(tmp_path, how):
     srv = _listener()
     script = tmp_path / "shutdown_target.py"
     script.write_text(SHUTDOWN_TARGET)
-    proc = subprocess.Popen([sys.executable, str(script), str(srv.getsockname()[1]), how],
+    proc = subprocess.Popen([sys.executable, str(script), str(srv.getsockname()[1]), how.value],
                             env=dict(os.environ, PROMPT_TOOLKIT_NO_CPR="1"),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:

@@ -14,6 +14,7 @@ import threading
 import time
 
 from reverse_ipdb import protocol, pty_bridge
+from reverse_ipdb.protocol import Field
 
 # The special name Docker maps to the host machine. Resolves automatically on
 # Docker Desktop (macOS/Windows); on Linux the container must be started with
@@ -46,21 +47,6 @@ def cool_down(seconds):
     _local.skip_until = time.monotonic() + seconds
 
 
-def enable_keepalive(sock):
-    """Probe an idle connection so a peer that vanished (container killed,
-    network gone) reads as a hang-up within about a minute instead of never.
-    """
-    with contextlib.suppress(OSError):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    for name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
-        try:
-            option = getattr(socket, name)
-        except AttributeError:
-            continue  # not exposed on this platform: the OS default cadence then
-        with contextlib.suppress(OSError):
-            sock.setsockopt(socket.IPPROTO_TCP, option, value)
-
-
 def resolve_target(host=None, port=None):
     """Resolve the (host, port) to dial, applying env vars and defaults."""
     host = host or os.environ.get("DEBUG_HOST", DEFAULT_HOST)
@@ -75,10 +61,10 @@ def banner():
     ``host``/``pid``/``thread`` are the identity it shows in its roster.
     """
     return protocol.encode({
-        "reverse_ipdb": "pty",
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-        "thread": threading.current_thread().name,
+        Field.KIND: protocol.PTY,
+        Field.HOST: socket.gethostname(),
+        Field.PID: os.getpid(),
+        Field.THREAD: threading.current_thread().name,
     })
 
 
@@ -106,21 +92,14 @@ def dial(host=None, port=None):
         _shell_lock.release()
         raise
     sock.settimeout(None)
-    enable_keepalive(sock)
+    protocol.keep_alive(sock)
     released = False
 
     def release():
         nonlocal released
         if not released:
             released = True
-            # shutdown, not just close: while another thread is blocked in
-            # recv on this socket, Linux sends no FIN on close() — the
-            # listener would never learn we left, and keep the session (and
-            # everyone queued behind it) waiting.
-            with contextlib.suppress(OSError):
-                sock.shutdown(socket.SHUT_RDWR)
-            with contextlib.suppress(OSError):
-                sock.close()
+            protocol.hang_up(sock)  # a real FIN, even while a pump is in recv
             _shell_lock.release()
 
     return sock, release
@@ -129,9 +108,9 @@ def dial(host=None, port=None):
 def handshake(sock):
     """Send our banner and read the listener's reply (see ``protocol``).
 
-    ``{"cols": .., "rows": ..}`` -> that terminal size, defaults for what's
-    missing. ``{"continue": true}`` -> ``None``: no shell for us — and with
-    ``"cooldown": <seconds>`` this thread doesn't dial again for that long.
+    ``COLS`` / ``ROWS`` -> that terminal size, defaults for what's missing.
+    ``CONTINUE`` -> ``None``: no shell for us — and with ``COOLDOWN``
+    seconds this thread doesn't dial again for that long.
     The listener hanging up -> ``None`` too. A plain socat/nc listener never
     replies, so after ``REPLY_TIMEOUT`` we fall back to the default size.
     """
@@ -145,13 +124,13 @@ def handshake(sock):
         return None
     sock.settimeout(None)
     reply = protocol.decode(line)
-    if reply.get("continue"):
-        if reply.get("cooldown"):
+    if reply.get(Field.CONTINUE):
+        if reply.get(Field.COOLDOWN):
             with contextlib.suppress(TypeError, ValueError):
-                cool_down(float(reply["cooldown"]))
+                cool_down(float(reply[Field.COOLDOWN]))
         return None
     try:
-        return int(reply.get("cols", DEFAULT_COLS)), int(reply.get("rows", DEFAULT_ROWS))
+        return int(reply.get(Field.COLS, DEFAULT_COLS)), int(reply.get(Field.ROWS, DEFAULT_ROWS))
     except (TypeError, ValueError):
         return DEFAULT_COLS, DEFAULT_ROWS
 

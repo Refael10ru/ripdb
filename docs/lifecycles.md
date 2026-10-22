@@ -20,10 +20,10 @@ traced memory.
 |---|---|---|
 | socket to the listener | `client.dial` | `release()`: shutdown + close, once, however the session ends |
 | shell lock | `client.dial` | `release()` |
-| pty master | `pty_bridge.run` | the pty→socket pump, when it ends (slave closed) |
-| pty slave (2 fds) | `pty_bridge.run` | the debugged thread on detach, or the pump at once when a hang-up finds the debugger idle |
-| pty→socket pump thread | `pty_bridge.run` | ends on EIO once the slave is closed |
-| socket→pty pump thread | `pty_bridge.run` | ends when `release()` shuts the socket down |
+| pty master | `pty_bridge.Bridge` | the pty→socket pump, when it ends (slave closed) |
+| pty slave (2 fds) | `pty_bridge.Bridge` | `Bridge.close` from the debugged thread on detach, or from a pump at once when a hang-up finds the debugger idle |
+| pty→socket pump thread | `pty_bridge.Bridge` | ends on EIO once the slave is closed |
+| socket→pty pump thread | `pty_bridge.Bridge` | ends when `release()` shuts the socket down |
 | prompt thread, one per prompt (`_PromptThread`, standing in for `TerminalPdb.thread_executor`) | `ReverseIPdb` | a daemon thread that ends when its prompt returns: a line, end-of-file, or a hang-up |
 | `TerminalPdb`'s own `ThreadPoolExecutor` | IPython | retired unused in `ReverseIPdb.__init__`, before it starts a thread |
 | asyncio loop per prompt | prompt_toolkit | `asyncio.run` closes it after each prompt |

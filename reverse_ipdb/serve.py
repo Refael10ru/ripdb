@@ -29,6 +29,7 @@ still waiting. At the idle roster, Ctrl-C quits as usual.
 import argparse
 import collections
 import contextlib
+import enum
 import os
 import queue
 import select
@@ -39,8 +40,10 @@ import termios
 import threading
 import time
 import tty
+from typing import NamedTuple
 
 from reverse_ipdb import protocol
+from reverse_ipdb.protocol import Field
 
 
 def _note(msg):
@@ -48,17 +51,35 @@ def _note(msg):
     print(f"*** {msg}", file=sys.stderr, flush=True)
 
 
-def _identity(msg):
-    """``<host> pid=.. thread=..`` from a decoded banner, built from whichever
-    of those keys it sent (``""`` if none)."""
-    parts = [str(msg["host"])] if "host" in msg else []
-    parts += [f"{key}={msg[key]}" for key in ("pid", "thread") if key in msg]
-    return " ".join(parts)
+class Identity(NamedTuple):
+    """Who a container is, from its banner: shown as ``<host> pid=.. thread=..``
+    with whichever parts it sent."""
+
+    host: object = None
+    pid: object = None
+    thread: object = None
+
+    @classmethod
+    def from_banner(cls, msg):
+        """Whatever JSON the banner carries, as strings (hashable: the digest
+        counts by identity)."""
+        return cls(*(None if msg.get(key) is None else str(msg[key])
+                     for key in (Field.HOST, Field.PID, Field.THREAD)))
+
+    @property
+    def process(self):
+        return self._replace(thread=None)
+
+    def __str__(self):
+        parts = [] if self.host is None else [str(self.host)]
+        parts += [f"{key.value}={value}" for key, value in
+                  ((Field.PID, self.pid), (Field.THREAD, self.thread)) if value is not None]
+        return " ".join(parts)
 
 
 def _read_banner(conn):
     """The target's identity from its banner line (see ``protocol``)."""
-    return _identity(protocol.decode(protocol.read_line(conn)))
+    return Identity.from_banner(protocol.decode(protocol.read_line(conn)))
 
 
 def _terminal_size():
@@ -67,22 +88,6 @@ def _terminal_size():
         if size.columns and size.lines:  # a fresh pty can report 0x0
             return size.columns, size.lines
     return 80, 24
-
-
-def _enable_keepalive(conn):
-    """Probe idle connections, so a container that vanished without a FIN
-    (killed, network gone) reads as a hang-up within about a minute and
-    stops holding the attached slot. Same cadence as the target side; kept
-    separate because the listener shares no code with the target stack."""
-    with contextlib.suppress(OSError):
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    for name, value in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
-        try:
-            option = getattr(socket, name)
-        except AttributeError:
-            continue  # not exposed on this platform: the OS default cadence then
-        with contextlib.suppress(OSError):
-            conn.setsockopt(socket.IPPROTO_TCP, option, value)
 
 
 def _note_continued(counts):
@@ -99,17 +104,17 @@ def _note_continued(counts):
     per_proc = collections.Counter()
     threads = collections.defaultdict(set)
     for ident, n in counts.items():
-        proc, _, thread = ident.partition(" thread=")
-        per_proc[proc] += n
-        threads[proc].add(thread)
+        per_proc[ident.process] += n
+        threads[ident.process].add(ident.thread)
 
     def describe(proc, n):
-        names = threads[proc] - {""}
-        who = proc
+        names = threads[proc] - {None}
         if len(names) == 1:
-            who += f" thread={names.pop()}"
+            who = str(proc._replace(thread=next(iter(names))))
         elif names:
-            who += f" ({len(names)} threads)"
+            who = f"{proc} ({len(names)} threads)"
+        else:
+            who = str(proc)
         return f"{who} ×{n}" if n > 1 else who
 
     top = per_proc.most_common(3)
@@ -124,19 +129,6 @@ def _reply(conn, fields):
     """Answer a banner with one protocol line (see ``protocol``)."""
     with contextlib.suppress(OSError):
         conn.sendall(protocol.encode(fields))
-
-
-def _hangup(conn):
-    """Release a container: it reads EOF and runs on.
-
-    ``shutdown`` before ``close`` so the FIN goes out even if another thread
-    still holds the socket (a bare ``close`` then sends nothing on Linux, and
-    the container would stay paused at its breakpoint).
-    """
-    with contextlib.suppress(OSError):
-        conn.shutdown(socket.SHUT_RDWR)
-    with contextlib.suppress(OSError):
-        conn.close()
 
 
 DEFAULT_COOLDOWN = 1.0  # the default mode: no queue, turned-away threads stay away 1s
@@ -190,16 +182,22 @@ def _restore_terminal(fd, saved):
         signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
+class Ending(enum.Enum):
+    """How an attached session ended, as the roster says it."""
+
+    DETACHED = "detached"  # the target hung up (you detached), the instant it does
+    DROPPED = "dropped"    # Ctrl-] (or our own stdin closed)
+    STALLED = f"dropped (not reading input for {SEND_TIMEOUT:g}s)"
+
+
 def _pump(conn):
     """Raw pass-through bridge: a transparent terminal between you and the target.
 
     Shuttles bytes both ways via select — keystrokes (TAB and Ctrl-C
     included) reach the target and its vt100 rendering comes straight back.
-    Returns how the session ended:
-
-    - ``"detached"`` — the target hung up (you detached), the instant it does;
-    - ``"dropped"``  — Ctrl-] arrived as a byte (stdin isn't a terminal);
-    - ``"stalled"``  — the target stopped taking input for ``SEND_TIMEOUT``.
+    Returns the ``Ending``: ``DROPPED`` when Ctrl-] arrives as a byte (stdin
+    isn't a terminal), ``STALLED`` when the target stops taking input for
+    ``SEND_TIMEOUT``.
 
     On a terminal Ctrl-] never arrives as a byte: it raises
     ``KeyboardInterrupt`` here, and the caller drops the session. Whatever was
@@ -220,23 +218,23 @@ def _pump(conn):
                 try:
                     data = conn.recv(65536)
                 except OSError:
-                    return "detached"  # reset by the target
+                    return Ending.DETACHED  # reset by the target
                 if not data:
-                    return "detached"
+                    return Ending.DETACHED
                 os.write(sys.stdout.fileno(), data)
             if fd in readable:
                 data = os.read(fd, 65536)
                 if not data:
-                    return "dropped"  # our own stdin closed: nobody to drive it
+                    return Ending.DROPPED  # our own stdin closed: nobody to drive it
                 data, drop, _ = data.partition(DROP_KEY)
                 try:
                     conn.sendall(data)
                 except TimeoutError:
-                    return "stalled"
+                    return Ending.STALLED
                 except OSError:
-                    return "detached"
+                    return Ending.DETACHED
                 if drop:
-                    return "dropped"
+                    return Ending.DROPPED
     finally:
         _restore_terminal(fd, saved)
 
@@ -260,111 +258,121 @@ def serve(host="0.0.0.0", port=4444, keep=False, cooldown=DEFAULT_COOLDOWN):
     reason. Ctrl-] while attached drops the session; a second one within
     ``QUIT_WINDOW`` (or Ctrl-C at the idle roster) quits.
     """
-    sessions = queue.Queue()
-    stopping = threading.Event()
-    slot = threading.Lock()   # no-queue mode: held from arrival until detach
-    continued = collections.Counter()  # no-queue mode: turned away while the slot was held
-    continued_lock = threading.Lock()  # handshake threads count, the foreground reports
-    held = set()              # every container we haven't released yet
-    held_lock = threading.Lock()
-    cols, rows = _terminal_size()
-
-    def release(conn):
-        with held_lock:
-            held.discard(conn)
-        _hangup(conn)
-
-    def handshake(conn, addr):
-        try:
-            conn.settimeout(BANNER_TIMEOUT)
-            line = protocol.read_line(conn)
-            if not line or stopping.is_set():  # hung up, or silent for BANNER_TIMEOUT
-                if not stopping.is_set():
-                    _note(f"ignored: {addr[0]}:{addr[1]} (no banner)")
-                release(conn)
-                return
-            ident = _identity(protocol.decode(line)) or f"{addr[0]}:{addr[1]}"
-            conn.settimeout(None)
-            if cooldown is not None and not slot.acquire(blocking=False):
-                _reply(conn, {"continue": True, "cooldown": cooldown})
-                release(conn)
-                with continued_lock:
-                    continued[ident] += 1  # reported in one line on detach
-                return
-            _reply(conn, {"cols": cols, "rows": rows})
-            sessions.put((conn, ident))
-            _note(f"queued: {ident}  ({sessions.qsize()} waiting)")
-        except Exception:  # never let one connection take a container down with it
-            release(conn)
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((host, port))
-        listener.listen(128)  # roomy backlog so a burst of containers isn't refused
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(128)  # roomy backlog so a burst of containers isn't refused
         mode = ("queue" if cooldown is None else f"no queue, {cooldown:g}s cooldown")
         mode += ", keep-alive" if keep else ", one-shot"
         _note(f"reverse_ipdb listening on {host}:{port} ({mode}) — Ctrl-C to quit; "
               "while attached, Ctrl-] drops the session (twice: quit)")
+        _Listener(sock, keep, cooldown).run()
 
-        def acceptor():
-            while not stopping.is_set():
-                try:
-                    conn, addr = listener.accept()
-                except OSError:
-                    return  # listener shut down -> we're exiting
-                with held_lock:
-                    if stopping.is_set():
-                        _hangup(conn)
-                        return
-                    held.add(conn)
-                _enable_keepalive(conn)  # a vanished container must not hold the slot
-                threading.Thread(target=handshake, args=(conn, addr), daemon=True).start()
 
-        accepting = threading.Thread(target=acceptor, daemon=True)
+class _Listener:
+    """The state ``serve`` shares between its threads: the acceptor, one
+    handshake thread per arrival, and the foreground that drives sessions."""
+
+    def __init__(self, sock, keep, cooldown):
+        self.sock = sock
+        self.keep = keep
+        self.cooldown = cooldown   # None: queue everyone
+        self.sessions = queue.Queue()
+        self.stopping = threading.Event()
+        self.slot = threading.Lock()   # no-queue mode: held from arrival until detach
+        self.continued = collections.Counter()  # turned away while the slot was held
+        self.continued_lock = threading.Lock()  # handshakes count, the foreground reports
+        self.held = set()              # every container we haven't released yet
+        self.held_lock = threading.Lock()
+        self.cols, self.rows = _terminal_size()
+
+    def release(self, conn):
+        with self.held_lock:
+            self.held.discard(conn)
+        protocol.hang_up(conn)
+
+    def accept(self):
+        while not self.stopping.is_set():
+            try:
+                conn, addr = self.sock.accept()
+            except OSError:
+                return  # listener shut down -> we're exiting
+            with self.held_lock:
+                if self.stopping.is_set():
+                    protocol.hang_up(conn)
+                    return
+                self.held.add(conn)
+            protocol.keep_alive(conn)  # a vanished container must not hold the slot
+            threading.Thread(target=self.handshake, args=(conn, addr), daemon=True).start()
+
+    def handshake(self, conn, addr):
+        try:
+            conn.settimeout(BANNER_TIMEOUT)
+            line = protocol.read_line(conn)
+            if not line or self.stopping.is_set():  # hung up, or silent for BANNER_TIMEOUT
+                if not self.stopping.is_set():
+                    _note(f"ignored: {addr[0]}:{addr[1]} (no banner)")
+                self.release(conn)
+                return
+            ident = Identity.from_banner(protocol.decode(line))
+            if not any(ident):
+                ident = Identity(host=f"{addr[0]}:{addr[1]}")
+            conn.settimeout(None)
+            if self.cooldown is not None and not self.slot.acquire(blocking=False):
+                _reply(conn, {Field.CONTINUE: True, Field.COOLDOWN: self.cooldown})
+                self.release(conn)
+                with self.continued_lock:
+                    self.continued[ident] += 1  # reported in one line on detach
+                return
+            _reply(conn, {Field.COLS: self.cols, Field.ROWS: self.rows})
+            self.sessions.put((conn, ident))
+            _note(f"queued: {ident}  ({self.sessions.qsize()} waiting)")
+        except Exception:  # never let one connection take a container down with it
+            self.release(conn)
+
+    def run(self):
+        accepting = threading.Thread(target=self.accept, daemon=True)
         accepting.start()
-
         last_drop = None
         try:
             while True:
-                conn, ident = sessions.get()
-                if conn not in held:
+                conn, ident = self.sessions.get()
+                if conn not in self.held:
                     continue  # released meanwhile (we're shutting down)
-                waiting = sessions.qsize()
+                waiting = self.sessions.qsize()
                 suffix = f"  ({waiting} still waiting)" if waiting else ""
                 _note(f"attached: {ident}{suffix}")
                 try:
-                    outcome = _pump(conn)
+                    ending = _pump(conn).value
                 except KeyboardInterrupt:
                     now = time.monotonic()
                     if last_drop is not None and now - last_drop < QUIT_WINDOW:
-                        release(conn)
-                        _note(f"dropped: {ident}")
+                        self.release(conn)
+                        _note(f"{Ending.DROPPED.value}: {ident}")
                         raise  # second Ctrl-] in a row: quit
                     last_drop = now
-                    outcome = "dropped"
+                    ending = Ending.DROPPED.value
                 except Exception as exc:  # one bad session must not kill the listener
-                    outcome = f"session error ({exc!r})"
-                release(conn)
-                if outcome == "stalled":
-                    outcome = f"dropped (not reading input for {SEND_TIMEOUT:g}s)"
-                _note(f"{outcome}: {ident}")
-                if cooldown is not None:
-                    with continued_lock:
-                        _note_continued(continued)
-                    slot.release()
-                if not keep:
+                    ending = f"session error ({exc!r})"
+                self.release(conn)
+                _note(f"{ending}: {ident}")
+                if self.cooldown is not None:
+                    with self.continued_lock:
+                        _note_continued(self.continued)
+                    self.slot.release()
+                if not self.keep:
                     return
         finally:
             # Release everyone still waiting on us: queued, mid-handshake, and
             # (once accept() is woken) nobody new gets held after this.
-            with held_lock:
-                stopping.set()
-                pending = list(held)
-                held.clear()
+            with self.held_lock:
+                self.stopping.set()
+                pending = list(self.held)
+                self.held.clear()
             with contextlib.suppress(OSError):
-                listener.shutdown(socket.SHUT_RDWR)  # wakes accept(); close() alone doesn't
+                self.sock.shutdown(socket.SHUT_RDWR)  # wakes accept(); close() alone doesn't
             for conn in pending:
-                _hangup(conn)
+                protocol.hang_up(conn)
             accepting.join(timeout=1.0)
 
 

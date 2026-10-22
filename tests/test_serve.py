@@ -22,14 +22,14 @@ from reverse_ipdb import serve as serve_mod
 
 
 def _banner(**fields):
-    return protocol.encode({"reverse_ipdb": "pty", **fields})
+    return protocol.encode({protocol.Field.KIND: protocol.PTY, **fields})
 
 
 def test_read_banner_builds_identity_without_overreading():
     a, b = socket.socketpair()
     # Banner line followed immediately by debugger output on the same stream.
     a.sendall(_banner(host="host", pid=1, thread="MainThread") + b"\x1b[?2004h(ipdb) ")
-    assert serve_mod._read_banner(b) == "host pid=1 thread=MainThread"
+    assert str(serve_mod._read_banner(b)) == "host pid=1 thread=MainThread"
     # The bytes after the banner must still be readable (not consumed).
     assert b.recv(4096) == b"\x1b[?2004h(ipdb) "
     a.close()
@@ -39,7 +39,7 @@ def test_read_banner_builds_identity_without_overreading():
 def test_read_banner_tolerates_missing_and_unknown_keys():
     a, b = socket.socketpair()
     a.sendall(_banner(pid=7, future="ignored"))
-    assert serve_mod._read_banner(b) == "pid=7"
+    assert str(serve_mod._read_banner(b)) == "pid=7"
     a.close()
     b.close()
 
@@ -47,11 +47,11 @@ def test_read_banner_tolerates_missing_and_unknown_keys():
 def test_read_banner_empty_on_immediate_close_or_garbage():
     a, b = socket.socketpair()
     a.close()
-    assert serve_mod._read_banner(b) == ""
+    assert str(serve_mod._read_banner(b)) == ""
     b.close()
     a, b = socket.socketpair()
     a.sendall(b"*** reverse_ipdb/pty host pid=1 thread=MainThread\n")   # pre-JSON banner
-    assert serve_mod._read_banner(b) == ""
+    assert str(serve_mod._read_banner(b)) == ""
     a.close()
     b.close()
 
@@ -139,7 +139,7 @@ def test_no_queue_continues_everyone_while_busy():
     def hold_until_remote_closes(conn):   # stand-in for the raw tty bridge
         while conn.recv(65536):
             pass
-        return "detached"
+        return serve_mod.Ending.DETACHED
 
     serve_mod._pump = hold_until_remote_closes
     t = threading.Thread(target=serve_mod.serve, args=("127.0.0.1", port, True, 2.5),
@@ -208,7 +208,7 @@ def test_continued_digest_groups_by_container(capsys):
     serve_mod._note_continued(counts)                 # nothing to say
     assert capsys.readouterr().err == ""
 
-    counts.update(["a"] * 5 + ["b"] * 2 + ["c", "d", "e"])
+    counts.update(serve_mod.Identity(host) for host in "aaaaabbcde")
     serve_mod._note_continued(counts)
     assert capsys.readouterr().err == "*** continued ×10 while attached: a ×5, b ×2, c, +2 more\n"
     assert not counts                                 # drained
@@ -218,8 +218,8 @@ def test_continued_digest_groups_threads_by_process(capsys):
     # Many threads of one process looping through the breakpoint are one entry.
     counts = collections.Counter()
     for t in range(12):
-        counts[f"worker-3a1 pid=9 thread=Thread-{t}"] += 100
-    counts["web-7f9c pid=12 thread=MainThread"] += 1
+        counts[serve_mod.Identity("worker-3a1", 9, f"Thread-{t}")] += 100
+    counts[serve_mod.Identity("web-7f9c", 12, "MainThread")] += 1
     serve_mod._note_continued(counts)
     assert capsys.readouterr().err == (
         "*** continued ×1201 while attached: "

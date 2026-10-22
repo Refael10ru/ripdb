@@ -4,7 +4,7 @@ import inspect
 
 import reverse_ipdb
 from reverse_ipdb import api, client
-from reverse_ipdb.debugger import DetachMixin, ReverseIPdb
+from reverse_ipdb.debugger import ReverseIPdb
 
 
 def test_frame_is_set_trace_only():
@@ -59,6 +59,5 @@ def test_docker_set_trace_respects_arg_then_env(monkeypatch):
 
 
 def test_reverse_ipdb_detaches_on_quit():
-    assert issubclass(ReverseIPdb, DetachMixin)
-    assert ReverseIPdb.do_quit is DetachMixin.do_detach
-    assert ReverseIPdb.do_EOF is DetachMixin.do_detach
+    assert ReverseIPdb.do_quit is ReverseIPdb.do_detach
+    assert ReverseIPdb.do_EOF is ReverseIPdb.do_detach

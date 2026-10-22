@@ -61,20 +61,6 @@ def _set_winsize(fd, cols, rows):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def _pump(src_read, dst_write, on_eof):
-    """Copy src -> dst until either side dies, then fire on_eof once."""
-    try:
-        while True:
-            data = src_read(65536)
-            if not data:
-                break
-            dst_write(data)
-    except OSError:
-        pass
-    finally:
-        on_eof()
-
-
 def _abort(sock, release, reason):
     """Fail open after dialing: say why on stderr and on the listener, then
     hang up so the program runs on and later breakpoints still work.
@@ -115,61 +101,101 @@ def run(frame, sock, release, cols, rows):
         _abort(sock, release, "debugger import failed, continuing without a shell")
         return
 
-    master_fd, slave_fd = os.openpty()  # api.set_trace guards non-POSIX first
-    _set_winsize(slave_fd, cols, rows)
-
-    slave_in = os.fdopen(slave_fd, "r", buffering=1, encoding="utf-8", errors="replace")
-    slave_out = os.fdopen(os.dup(slave_fd), "w", buffering=1, encoding="utf-8",
-                          errors="replace")
-
-    pt_in = Vt100Input(slave_in)
-    pt_out = Vt100_Output.from_pty(slave_out)
-
-    dbg = ReverseIPdb(
-        stdin=slave_in, stdout=slave_out,
+    bridge = Bridge(sock, release, cols, rows)
+    dbg = bridge.dbg = ReverseIPdb(
+        bridge,
+        stdin=bridge.slave_in, stdout=bridge.slave_out,
         nosigint=True, readrc=False,
-        pt_session_options={"input": pt_in, "output": pt_out},
+        pt_session_options={"input": Vt100Input(bridge.slave_in),
+                            "output": Vt100_Output.from_pty(bridge.slave_out)},
     )
     # TerminalPdb refuses use_rawinput=False, but passing stdin set it off;
-    # prompt_toolkit uses pt_in/pt_out regardless, so force it back on.
+    # prompt_toolkit uses its own input/output regardless, so force it back on.
     dbg.use_rawinput = True
+    bridge.start()
+    try:
+        dbg.set_trace(frame)
+    except BaseException:
+        bridge.close()
+        raise
 
-    close_lock = threading.Lock()
-    closed = False
-    debugging_thread = threading.get_ident()  # runs the prompt loop and do_detach
 
-    def retire_slave():
-        """Nothing will prompt on the pty again: retire the prompt thread and
-        close the slave (the output pump then drains, ends, closes the master).
-        Idempotent."""
-        with contextlib.suppress(Exception):
-            dbg.thread_executor.shutdown(wait=False)
-        for closer in (slave_in.close, slave_out.close):
+class Bridge:
+    """A pty for the debugger, and two pumps linking its master to ``sock``.
+
+    The debugger talks to the slave (``slave_in`` / ``slave_out``); the
+    output pump copies master -> socket, the input pump socket -> master.
+    Torn down by ``close``, from whichever side ends first.
+    """
+
+    def __init__(self, sock, release, cols, rows):
+        self.sock = sock
+        self.release = release  # hangs up the socket and frees the shell lock
+        self.dbg = None         # set by run, before start
+        self.thread = threading.get_ident()  # the debugged thread
+        self.master, slave = os.openpty()
+        _set_winsize(slave, cols, rows)
+        self.slave_in = os.fdopen(slave, "r", buffering=1, encoding="utf-8",
+                                  errors="replace")
+        self.slave_out = os.fdopen(os.dup(slave), "w", buffering=1, encoding="utf-8",
+                                   errors="replace")
+        # The master fd is closed exactly once, by the output pump when it ends
+        # (its only reader), and writes check under the lock: a closed fd
+        # number can be reused by the program at once, and a late write must
+        # never land on whatever it opened.
+        self.master_lock = threading.Lock()
+        self.master_open = True
+        self.close_lock = threading.Lock()
+        self.closed = False
+        self.output_pump = threading.Thread(target=self._pump_output, daemon=True)
+        self.input_pump = threading.Thread(target=self._pump_input, daemon=True)
+
+    def start(self):
+        self.output_pump.start()
+        self.input_pump.start()
+
+    def close(self):
+        """Tear the bridge down, from either side.
+
+        From the debugged thread (``detach``): it's past its prompt, so close
+        the slave first and let the output pump drain the parting output.
+        From a pump (the listener hung up): the debugger may be blocked in its
+        prompt, and closing fds under a blocked reader never wakes it — the
+        debugged thread would stay paused forever. ``hang_up`` ends the prompt
+        instead; the debugger takes that as ``detach`` and comes back here to
+        close the slave itself.
+        """
+        from_debugger = threading.get_ident() == self.thread
+        with self.close_lock:
+            first, self.closed = not self.closed, True
+        if from_debugger:
+            # It has left its prompt for good (only here — a debugger still
+            # mid-command needs the prompt thread for one more, hung-up prompt).
+            self._retire_slave()
+        if not first:
+            return
+        if from_debugger:
+            self.output_pump.join(timeout=DRAIN_TIMEOUT)  # slave closed: it drains, ends
+        else:
+            idle = False
+            with contextlib.suppress(Exception):
+                idle = self.dbg.hang_up()
+            if idle:
+                # Not inside a stop or the trace function, and neither can
+                # start now: nothing will read or write the pty again — even
+                # if the program never traces another line (thread ended, or
+                # blocked for good). Retire it here instead of waiting.
+                self._retire_slave()
+        self.release()  # hangs up the socket (waking the input pump), frees the lock
+
+    def _retire_slave(self):
+        """Nothing will prompt on the pty again: close the slave (the output
+        pump then drains, ends, closes the master). Idempotent."""
+        for closer in (self.slave_in.close, self.slave_out.close):
             with contextlib.suppress(OSError):
                 closer()
 
-    # The master fd is closed exactly once, by the pty->socket pump when it
-    # ends (the only reader), and writes check under a lock: a closed fd
-    # number can be reused by the program at once, and a late read or write
-    # must never land on whatever it opened.
-    master_lock = threading.Lock()
-    master_open = True
-
-    def write_master(data):
-        with master_lock:
-            if not master_open:
-                raise OSError("pty closed")
-            os.write(master_fd, data)
-
-    def close_master():
-        nonlocal master_open
-        with master_lock:
-            if master_open:
-                master_open = False
-                with contextlib.suppress(OSError):
-                    os.close(master_fd)
-
-    def pump_output():
+    def _pump_output(self):
         """pty -> socket. Once the listener is gone, keep reading and discard:
         the debugger may still write (a command's output, the stack at the
         next breakpoint) before it detaches, and a pty nobody reads would
@@ -179,87 +205,52 @@ def run(frame, sock, release, cols, rows):
         try:
             while True:
                 try:
-                    data = os.read(master_fd, 65536)
+                    data = os.read(self.master, 65536)
                 except OSError:
                     break  # EIO: slave closed
                 if not data:
                     break
                 if connected:
                     try:
-                        sock.sendall(data)
+                        self.sock.sendall(data)
                     except OSError:
                         connected = False
-                        close()
+                        self.close()
         finally:
-            close()
-            close_master()
+            self.close()
+            with self.master_lock:
+                self.master_open = False
+                with contextlib.suppress(OSError):
+                    os.close(self.master)
 
-    def close():
-        """Tear the bridge down, from either side.
+    def _pump_input(self):
+        """socket -> pty, until either side dies; then tear the bridge down."""
+        try:
+            while True:
+                data = self.sock.recv(65536)
+                if not data:
+                    break
+                self._to_pty(data)
+        except OSError:
+            pass
+        finally:
+            self.close()
 
-        From the debugger (``detach``): it's past its prompt, so close the
-        slave first and let the pty->socket pump drain the parting output.
-        From a pump (the listener hung up): the debugger may be blocked in its
-        prompt, and closing fds under a blocked reader never wakes it — the
-        target thread would stay paused forever. ``hang_up`` ends the prompt
-        instead; the debugger takes that as ``detach`` and comes back here to
-        close the slave itself.
-        """
-        nonlocal closed
-        from_debugger = threading.get_ident() == debugging_thread
-        with close_lock:
-            first = not closed
-            closed = True
-        if from_debugger:
-            # It has left its prompt for good (only here — a debugger still
-            # mid-command needs the prompt thread for one more, hung-up prompt).
-            retire_slave()
-        if not first:
-            return
-        if from_debugger:
-            output_pump.join(timeout=DRAIN_TIMEOUT)  # slave closed: it drains, then ends
-        else:
-            idle = False
+    def _to_pty(self, data):
+        """Ctrl-C bytes go to the debugger first: the pty is nobody's
+        controlling terminal, so on its own a ``\\x03`` would only ever reach
+        a prompt. Those the debugger handles are not passed on."""
+        parts = data.split(b"\x03")
+        kept = bytearray(parts[0])
+        for part in parts[1:]:
+            handled = False
             with contextlib.suppress(Exception):
-                idle = dbg.hang_up()
-            if idle:
-                # Not inside a stop or the trace function, and neither can
-                # start now: nothing will read or write the pty again — even
-                # if the program never traces another line (thread ended, or
-                # blocked for good). Retire it here instead of waiting.
-                retire_slave()
-        release()  # shuts down + closes the socket (waking the socket->pty pump), frees the lock
-
-    output_pump = threading.Thread(target=pump_output, daemon=True)
-    dbg._reverse_ipdb_close = close
-
-    def to_pty(data):
-        """listener -> pty. Ctrl-C bytes go to the debugger first: the pty is
-        nobody's controlling terminal, so on its own a ``\\x03`` would only
-        ever reach a prompt. Those the debugger handles are not passed on."""
-        if b"\x03" in data:
-            parts = data.split(b"\x03")
-            kept = bytearray(parts[0])
-            for part in parts[1:]:
-                handled = False
-                with contextlib.suppress(Exception):
-                    handled = dbg.interrupt()
-                if not handled:
-                    kept += b"\x03"
-                kept += part
-            data = bytes(kept)
-        if data:
-            write_master(data)
-
-    # Pump bytes both ways; either EOF tears the whole bridge down.
-    output_pump.start()
-    threading.Thread(
-        target=_pump, args=(sock.recv, to_pty, close),
-        daemon=True,
-    ).start()
-
-    try:
-        dbg.set_trace(frame)
-    except BaseException:
-        close()
-        raise
+                handled = self.dbg.interrupt()
+            if not handled:
+                kept += b"\x03"
+            kept += part
+        if kept:
+            with self.master_lock:
+                if not self.master_open:
+                    raise OSError("pty closed")
+                os.write(self.master, kept)

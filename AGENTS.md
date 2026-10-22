@@ -181,10 +181,12 @@ reverse_ipdb/
   api.py         layer 1: entry points (set_trace / set_trace_ipython) -> client.attach
   client.py      layer 2: attach() = dial() + handshake(); shell lock; cooldown -> pty_bridge.run
   pty_bridge.py  layer 3: run(frame, sock, release, cols, rows): deferred debugger import,
-                 pty, pumps <-> socket, teardown
-  debugger.py    layer 3: ReverseIPdb (TerminalPdb) + DetachMixin
-  protocol.py    the wire, shared by both ends: JSON-object-per-line encode / decode / read_line
-  serve.py       the peer: the listener, roster + raw pass-through (default no queue, --queue)
+                 then a Bridge: the pty, its two pumps <-> socket, teardown
+  debugger.py    layer 3: ReverseIPdb (TerminalPdb); its state is one _Session, a State enum
+  protocol.py    the wire, shared by both ends: the Field enum, JSON-object-per-line
+                 encode / decode / read_line, keep_alive / hang_up
+  serve.py       the peer: the listener (_Listener), roster + raw pass-through (default no
+                 queue, --queue); banners become an Identity, sessions end with an Ending
 ```
 
 Dependencies point **down only** (api → client → pty_bridge → debugger; serve
@@ -234,6 +236,13 @@ as `_register_atexit` does minus the shutdown check (the handler is still
 appended and still runs at the child's exit), then restores the original.
 `tests/test_shutdown_state.py` pins it. (Pure interpreter finalization is a
 different, unfixable case: then threads can't be created at all.)
+
+**No bare strings as signals.** What one function tells another — a
+debugger state, how a session ended, a handshake key — is an enum
+(`debugger.State`, `serve.Ending`, `protocol.Field`), and a target's identity
+is a `serve.Identity` tuple, not a formatted string to parse back. `Field` is a
+`str` enum so it can be a JSON key; display it with `.value` (`str()` of a
+`str` enum differs between 3.10 and 3.11+).
 
 **`hasattr` is banned in the library** (prefer EAFP / try-except). Ruff has no
 native check for it, so `tests/test_style.py` enforces it by AST-scanning
