@@ -24,7 +24,8 @@ traced memory.
 | pty slave (2 fds) | `pty_bridge.run` | the debugged thread on detach, or the pump at once when a hang-up finds the debugger idle |
 | pty→socket pump thread | `pty_bridge.run` | ends on EIO once the slave is closed |
 | socket→pty pump thread | `pty_bridge.run` | ends when `release()` shuts the socket down |
-| prompt thread (`TerminalPdb.thread_executor`) | IPython | shut down on detach, or on an idle hang-up |
+| prompt thread, one per prompt (`_PromptThread`, standing in for `TerminalPdb.thread_executor`) | `ReverseIPdb` | a daemon thread that ends when its prompt returns: a line, end-of-file, or a hang-up |
+| `TerminalPdb`'s own `ThreadPoolExecutor` | IPython | retired unused in `ReverseIPdb.__init__`, before it starts a thread |
 | asyncio loop per prompt | prompt_toolkit | `asyncio.run` closes it after each prompt |
 | `TerminalPdb.pt_loop` (epoll + socketpair) | IPython, never used or closed by it | closed by `_close_pt_loop` on detach or idle hang-up |
 | "KeyboardInterrupt pending" timer | `ReverseIPdb.interrupt` | one-shot daemon, ends after 1 s |

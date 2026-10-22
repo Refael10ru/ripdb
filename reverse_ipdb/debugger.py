@@ -26,6 +26,7 @@ import signal
 import sys
 import threading
 import traceback
+from concurrent.futures import Future
 
 from IPython.terminal.debugger import TerminalPdb
 
@@ -126,6 +127,39 @@ class DetachMixin:
     do_c = do_cont = do_continue
 
 
+class _PromptThread:
+    """Runs each prompt on its own short-lived daemon thread.
+
+    Stands in for ``TerminalPdb.thread_executor``, a ``ThreadPoolExecutor(1)``,
+    and offers the two calls TerminalPdb makes on it. A thread pool refuses
+    new work once ``concurrent.futures`` has seen the interpreter begin to
+    shut down ("cannot schedule new futures after interpreter shutdown"). That
+    happens as soon as the main thread finishes, while Python still waits for
+    non-daemon threads, and in children forked after that point. A breakpoint
+    hit in such a worker thread could never prompt, and the session detached
+    at once. A plain thread has no such check.
+    """
+
+    def submit(self, fn, *args, **kwargs):
+        future = Future()
+
+        def run():
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        threading.Thread(target=run, name="reverse_ipdb-prompt", daemon=True).start()
+        return future
+
+    def shutdown(self, wait=True, **kwargs):
+        """Nothing to retire: each prompt's thread ends with its prompt."""
+
+
 class ReverseIPdb(DetachMixin, TerminalPdb):
     """IPython's debugger over a pty, detaching on quit.
 
@@ -136,6 +170,10 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # TerminalPdb's thread pool hasn't started a thread yet (it does on the
+        # first submit); retire it and prompt on our own threads instead.
+        self.thread_executor.shutdown(wait=False)
+        self.thread_executor = _PromptThread()
         self._reverse_ipdb_lock = threading.Lock()
         self._reverse_ipdb_hung_up = False
         # Set by detach or a listener hang-up; from then on the next trace
