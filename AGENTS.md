@@ -90,6 +90,14 @@ Guarantees callers rely on — **do not break these**:
   finds the debugger idle retires the pty and threads at once. Every allocation
   is listed with its release in `tests/test_lifecycle_static.py`; see
   `docs/lifecycles.md`.
+- **A breakpoint works even while the interpreter shuts down.** Once the
+  main thread has finished, Python waits for non-daemon threads, and
+  `concurrent.futures` (if loaded) refuses new work: "cannot schedule new
+  futures after interpreter shutdown". A child forked after that point
+  inherits the refusal. TerminalPdb prompts on a `ThreadPoolExecutor`, so a
+  breakpoint in such a worker could never prompt and detached at once.
+  `ReverseIPdb` swaps in `_PromptThread`, one daemon thread per prompt, which
+  has no such check. `tests/test_session.py` pins both cases.
 - **POSIX only.** A pty is required, so the package imports `termios` at the
   top level — `import reverse_ipdb` only works on a Unix platform.
 
@@ -256,8 +264,10 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
   hangs up **while the program keeps running** (the queue-stall regression),
   `c` without breakpoints detaches, and a **listener** hang-up releases the
   target — at its prompt, mid-command (output still flowing) and between
-  breakpoints; and Ctrl-C interrupting a command (main and worker thread, with
-  the "pending" note for a blocking call) or stopping the running program.
+  breakpoints; Ctrl-C interrupting a command (main and worker thread, with
+  the "pending" note for a blocking call) or stopping the running program;
+  and a breakpoint in a worker thread after the main thread has finished (or
+  with the shutdown flag inherited by a fork) still getting a working prompt.
 - `tests/test_lifecycle.py` — one process through hundreds of no-listener and
   turned-away breakpoints and ten sessions ending every way: no fds, threads,
   debuggers or prompt sessions left, the stopped frame's 1 MiB local freed

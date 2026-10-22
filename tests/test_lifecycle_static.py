@@ -46,6 +46,9 @@ LIFECYCLES = {
     ("pty_bridge", "run", "threading.Thread"):
         "output pump: ends on EIO once the slave is closed, then closes the master. "
         "input pump: ends when release() shuts the socket down",
+    ("debugger", "submit", "threading.Thread"):
+        "one daemon thread per prompt (_PromptThread): ends when its prompt returns "
+        "a line, end-of-file, or is ended by a hang-up",
     ("debugger", "interrupt", "threading.Timer"):
         "one-shot 'pending' note, fires once after PENDING_NOTE_DELAY and ends",
     ("debugger", "_release", "sys.settrace"):
@@ -79,7 +82,10 @@ THREAD_CALLS = {"threading.Thread", "threading.Timer"}
 # scan above; we own their release. Each must keep a release call in the code.
 THIRD_PARTY = {
     ("pty_bridge", "dbg.thread_executor.shutdown"):
-        "TerminalPdb's one-thread prompt executor: shut down when the session ends",
+        "the prompt runner when the session ends (a no-op for _PromptThread, whose "
+        "threads end with their prompts; kept so a real executor would be retired)",
+    ("debugger", "self.thread_executor.shutdown"):
+        "TerminalPdb's own ThreadPoolExecutor, retired unused in __init__",
     ("debugger", "self.pt_loop.close"):
         "TerminalPdb's per-instance asyncio loop (unused, never closed by IPython)",
     ("debugger", "self._clear_own_breaks"):

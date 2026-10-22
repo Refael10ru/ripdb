@@ -349,3 +349,56 @@ def test_ctrl_c_while_running_stops_at_the_next_line(target):
         assert "Traceback" not in stdout, stdout
     finally:
         srv.close()
+
+
+SHUTDOWN_TARGET = textwrap.dedent(
+    """
+    import sys, threading, time
+    from concurrent.futures import ThreadPoolExecutor   # loaded: registers its shutdown hook
+    import reverse_ipdb
+
+    PORT, HOW = int(sys.argv[1]), sys.argv[2]
+
+    def parse():
+        answer = 21
+        if HOW == "main_returned":
+            time.sleep(0.5)                  # by now the main thread has finished
+        else:                                # a child forked after that point inherits this
+            import concurrent.futures.thread
+            concurrent.futures.thread._shutdown = True
+        reverse_ipdb.set_trace(host="127.0.0.1", port=PORT)
+        print("PARSED", answer, flush=True)
+
+    worker = threading.Thread(target=parse)  # a plain, non-daemon worker
+    worker.start()
+    if HOW != "main_returned":
+        worker.join()
+    """
+)
+
+
+@pytest.mark.parametrize("how", ["main_returned", "inherited_flag"])
+def test_breakpoint_after_the_interpreter_began_shutting_down(tmp_path, how):
+    """concurrent.futures refuses new work once the main thread has finished
+    (Python is waiting on non-daemon threads), and in children forked after
+    that. TerminalPdb prompted on a ThreadPoolExecutor, so a breakpoint in such
+    a worker failed with "cannot schedule new futures after interpreter
+    shutdown" and the session detached at once."""
+    srv = _listener()
+    script = tmp_path / "shutdown_target.py"
+    script.write_text(SHUTDOWN_TARGET)
+    proc = subprocess.Popen([sys.executable, str(script), str(srv.getsockname()[1]), how],
+                            env=dict(os.environ, PROMPT_TOOLKIT_NO_CPR="1"),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        conn = _attach(srv)
+        conn.sendall(b"p answer * 2\r")
+        _expect(conn, "42", "ipdb>")                    # the prompt really works
+        conn.sendall(b"detach\r")
+        stdout, rc = _finish(proc, srv)
+        assert "PARSED 21" in stdout and rc == 0, stdout
+        assert "cannot schedule new futures" not in stdout, stdout
+    finally:
+        srv.close()
+        if proc.poll() is None:
+            proc.kill()

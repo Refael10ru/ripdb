@@ -31,7 +31,7 @@ TARGET = textwrap.dedent(
     import reverse_ipdb
 
     PORT, DEAD_PORT, TURNED_AWAY, SESSIONS = (int(a) for a in sys.argv[1:5])
-    SESSION_THREADS = ("pump", "ThreadPoolExecutor", "Timer")
+    SESSION_THREADS = ("pump", "reverse_ipdb-prompt", "ThreadPoolExecutor", "Timer")
 
     def fds():
         return len(os.listdir("/proc/self/fd"))
