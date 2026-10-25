@@ -208,7 +208,7 @@ def test_continued_digest_groups_by_container(capsys):
     serve_mod._note_continued(counts)                 # nothing to say
     assert capsys.readouterr().err == ""
 
-    counts.update(serve_mod.Identity(host) for host in "aaaaabbcde")
+    counts.update(protocol.Identity(host) for host in "aaaaabbcde")
     serve_mod._note_continued(counts)
     assert capsys.readouterr().err == "*** continued ×10 while attached: a ×5, b ×2, c, +2 more\n"
     assert not counts                                 # drained
@@ -218,8 +218,8 @@ def test_continued_digest_groups_threads_by_process(capsys):
     # Many threads of one process looping through the breakpoint are one entry.
     counts = collections.Counter()
     for t in range(12):
-        counts[serve_mod.Identity("worker-3a1", 9, f"Thread-{t}")] += 100
-    counts[serve_mod.Identity("web-7f9c", 12, "MainThread")] += 1
+        counts[protocol.Identity("worker-3a1", 9, f"Thread-{t}")] += 100
+    counts[protocol.Identity("web-7f9c", 12, "MainThread")] += 1
     serve_mod._note_continued(counts)
     assert capsys.readouterr().err == (
         "*** continued ×1201 while attached: "

@@ -35,7 +35,20 @@ def _reply(a, **fields):
 def test_reply_size():
     a, b = _pair()
     _reply(a, cols=132, rows=43)
-    assert client.handshake(b) == (132, 43)
+    assert client.handshake(b) == client.Terminal(132, 43)
+    a.close()
+    b.close()
+
+
+def test_reply_line_mode_only_when_asked_for_exactly():
+    a, b = _pair()
+    _reply(a, cols=90, rows=30, line=True)
+    assert client.handshake(b) == client.Terminal(90, 30, line=True)
+    a.close()
+    b.close()
+    a, b = _pair()
+    _reply(a, line="yes")                              # not a JSON true: a terminal
+    assert client.handshake(b).line is False
     a.close()
     b.close()
 
@@ -43,12 +56,12 @@ def test_reply_size():
 def test_reply_tolerates_missing_and_unknown_keys():
     a, b = _pair()
     _reply(a, cols=100, future="ignored")              # no rows -> default rows
-    assert client.handshake(b) == (100, client.DEFAULT_ROWS)
+    assert client.handshake(b) == client.Terminal(100, client.DEFAULT_ROWS)
     a.close()
     b.close()
     a, b = _pair()
     a.sendall(b"80 24\n")                              # not a JSON object -> defaults
-    assert client.handshake(b) == (client.DEFAULT_COLS, client.DEFAULT_ROWS)
+    assert client.handshake(b) == client.Terminal(client.DEFAULT_COLS, client.DEFAULT_ROWS)
     a.close()
     b.close()
 
@@ -83,7 +96,7 @@ def test_reply_silence_falls_back_to_default_size(monkeypatch):
     # A plain socat/nc listener never replies: default size after the timeout.
     monkeypatch.setattr(client, "REPLY_TIMEOUT", 0.05)
     a, b = _pair()
-    assert client.handshake(b) == (client.DEFAULT_COLS, client.DEFAULT_ROWS)
+    assert client.handshake(b) == client.Terminal(client.DEFAULT_COLS, client.DEFAULT_ROWS)
     a.close()
     b.close()
 

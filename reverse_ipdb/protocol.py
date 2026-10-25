@@ -7,21 +7,37 @@ repurpose or remove them. After the reply the socket is a raw vt100 stream.
 
 Target -> listener, the banner::
 
-    {"reverse_ipdb": "pty", "host": "web-7f9c", "pid": 12, "thread": "MainThread"}
+    {"reverse_ipdb": "pty", "host": "web-7f9c", "pid": 12, "thread": "MainThread",
+     "line": true}                         # it can do line mode (below)
 
 Listener -> target, the reply (sent at once, from the acceptor)::
 
     {"cols": 120, "rows": 40}              # attach: pty size (default 80x24)
+    {"cols": 120, "rows": 40, "line": true}  # attach in line mode
     {"continue": true, "cooldown": 1.0}    # no shell; don't dial again for 1s
+
+Line mode is for programs, not people (``reverse_ipdb.agent``): no
+prompt_toolkit, no echo, no colour — plain lines in, plain text out, and each
+prompt wrapped in ``PROMPT_START`` / ``PROMPT_END`` so the reader knows when
+a command's output is complete.
 """
 
 import contextlib
 import enum
 import json
 import socket
+from typing import NamedTuple
 
 LINE_LIMIT = 4096  # a handshake line longer than this is not one of ours
 PTY = "pty"        # the banner's Field.KIND: a raw pty stream follows
+
+# Line mode's prompt, marked with OSC 133 — the "semantic prompt" sequences of
+# terminal shell integration (FinalTerm, iTerm2, VS Code, WezTerm): invisible
+# on a terminal, unambiguous to a reader. Output before PROMPT_START belongs to
+# the previous command; after PROMPT_END the target is waiting for a line.
+PROMPT_START = "\x1b]133;A\x07"
+PROMPT_END = "\x1b]133;B\x07"
+LINE_PROMPT = f"{PROMPT_START}ipdb> {PROMPT_END}"
 
 
 class Field(str, enum.Enum):
@@ -34,8 +50,35 @@ class Field(str, enum.Enum):
     THREAD = "thread"
     COLS = "cols"           # reply: attach, with this terminal size
     ROWS = "rows"
+    LINE = "line"           # banner: line mode supported; reply: use it
     CONTINUE = "continue"   # reply: no shell, run on ...
     COOLDOWN = "cooldown"   # ... and don't dial again for this many seconds
+
+
+class Identity(NamedTuple):
+    """Who a container is, from its banner: shown as ``<host> pid=.. thread=..``
+    with whichever parts it sent."""
+
+    host: object = None
+    pid: object = None
+    thread: object = None
+
+    @classmethod
+    def from_banner(cls, msg):
+        """Whatever JSON the banner carries, as strings (hashable: the digest
+        counts by identity)."""
+        return cls(*(None if msg.get(key) is None else str(msg[key])
+                     for key in (Field.HOST, Field.PID, Field.THREAD)))
+
+    @property
+    def process(self):
+        return self._replace(thread=None)
+
+    def __str__(self):
+        parts = [] if self.host is None else [str(self.host)]
+        parts += [f"{key.value}={value}" for key, value in
+                  ((Field.PID, self.pid), (Field.THREAD, self.thread)) if value is not None]
+        return " ".join(parts)
 
 
 def encode(fields):

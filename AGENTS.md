@@ -1,7 +1,8 @@
 # AGENTS.md — integrating & extending reverse_ipdb
 
 Orientation for an agent (or human) picking this up. For usage prose see
-[README.md](README.md); for the completion internals see
+[README.md](README.md); for AI agents driving the debugger (MCP),
+[docs/agents.md](docs/agents.md); for the completion internals see
 [docs/completion.md](docs/completion.md) and [docs/api-layers.md](docs/api-layers.md); for
 what is allocated and when it is freed, [docs/lifecycles.md](docs/lifecycles.md).
 
@@ -157,13 +158,17 @@ are ignored** on both sides, so either side can add fields without breaking
 the other — add keys, never repurpose or remove them.
 
 1. Target connects and sends its banner:
-   `{"reverse_ipdb": "pty", "host": "<host>", "pid": <pid>, "thread": "<name>"}`.
+   `{"reverse_ipdb": "pty", "host": "<host>", "pid": <pid>, "thread": "<name>", "line": true}`.
    The listener shows `<host> pid=<pid> thread=<name>` (whichever it got) as
-   the session's identity.
+   the session's identity (`protocol.Identity`); `line` says it can do line mode.
 2. The listener replies **at once** (from its acceptor, not when it later
    attaches) with one of:
    - `{"cols": <n>, "rows": <n>}` — attach; the target sets the pty winsize
-     (80×24 for whatever is missing);
+     (80×24 for whatever is missing). With `"line": true` (exactly `true`) it
+     attaches in **line mode**, for a program: no prompt_toolkit, no colour,
+     no echo, each command one line, each prompt `protocol.LINE_PROMPT` —
+     `ipdb> ` wrapped in OSC 133 marks (`PROMPT_START` / `PROMPT_END`). Only
+     the agent's listener asks for it; `interact` and `debug` are refused there;
    - `{"continue": true, "cooldown": <seconds>}` — no shell: the target hangs
      up, releases the shell lock and runs on without importing IPython, and
      that thread doesn't dial again for `cooldown` seconds (0 if absent).
@@ -186,11 +191,18 @@ reverse_ipdb/
   protocol.py    the wire, shared by both ends: the Field enum, JSON-object-per-line
                  encode / decode / read_line, keep_alive / hang_up
   serve.py       the peer: the listener (_Listener), roster + raw pass-through (default no
-                 queue, --queue); banners become an Identity, sessions end with an Ending
+                 queue, --queue); sessions end with an Ending
+  agent.py       the peer for a program: AgentListener keeps every target open at once in
+                 line mode, a Session each (send / wait / interrupt / detach -> Reply)
+  mcp_server.py  agent.py as MCP tools (reverse_ipdb-mcp; optional `mcp` extra) + the
+                 instructions an agent gets on connecting
 ```
 
-Dependencies point **down only** (api → client → pty_bridge → debugger; serve
-and client share just `protocol`). `tests/test_layers.py` AST-scans every
+`skills/reverse-ipdb/SKILL.md` is the same workflow as a Claude Code skill;
+keep it, `mcp_server.INSTRUCTIONS` and `docs/agents.md` saying the same thing.
+
+Dependencies point **down only** (api → client → pty_bridge → debugger; serve,
+agent and client share just `protocol`; mcp_server sits on agent). `tests/test_layers.py` AST-scans every
 intra-package import, deferred ones included, and fails on any other edge —
 extend its `ALLOWED` table when adding a module, never by widening a layer.
 
@@ -239,8 +251,9 @@ different, unfixable case: then threads can't be created at all.)
 
 **No bare strings as signals.** What one function tells another — a
 debugger state, how a session ended, a handshake key — is an enum
-(`debugger.State`, `serve.Ending`, `protocol.Field`), and a target's identity
-is a `serve.Identity` tuple, not a formatted string to parse back. `Field` is a
+(`debugger.State`, `serve.Ending`, `agent.Status`, `protocol.Field`), and a
+target's identity is a `protocol.Identity` tuple, not a formatted string to
+parse back. `Field` is a
 `str` enum so it can be a JSON key; display it with `.value` (`str()` of a
 `str` enum differs between 3.10 and 3.11+).
 
@@ -288,6 +301,12 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
 - `tests/test_lifecycle_static.py` — every resource-creating call has a
   documented release (`LIFECYCLES`), every thread is a daemon, and every
   module-level state is accounted for (`MODULE_STATE`).
+- `tests/test_agent.py` — line mode against real targets: one command, one
+  plain-text reply (no escapes, prompt or echo; `ipdb> ` in the output kept),
+  stepping, breakpoints, "running" then Ctrl-C, several targets open at
+  once, an old target told to continue and listed as refused, the agent's
+  listener closing releasing everyone; and the MCP tools, in memory and over
+  real stdio.
 - `tests/test_api.py` — hand-off to `client.attach` and aliasing.
 - `tests/test_layers.py` — the import graph matches `docs/api-layers.md`.
 - `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,

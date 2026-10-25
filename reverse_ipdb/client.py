@@ -12,6 +12,7 @@ import os
 import socket
 import threading
 import time
+from typing import NamedTuple
 
 from reverse_ipdb import protocol, pty_bridge
 from reverse_ipdb.protocol import Field
@@ -30,6 +31,14 @@ DEFAULT_COLS, DEFAULT_ROWS = 80, 24
 # Only one thread/process gets the interactive shell at a time; others pass
 # through. The lock is held for the whole session and released when it ends.
 _shell_lock = threading.Lock()
+
+
+class Terminal(NamedTuple):
+    """What the listener's attach reply asks for."""
+
+    cols: int
+    rows: int
+    line: bool = False  # line mode: plain text for a program (see protocol)
 
 
 class _ThreadState(threading.local):
@@ -65,6 +74,7 @@ def banner():
         Field.HOST: socket.gethostname(),
         Field.PID: os.getpid(),
         Field.THREAD: threading.current_thread().name,
+        Field.LINE: True,
     })
 
 
@@ -108,7 +118,8 @@ def dial(host=None, port=None):
 def handshake(sock):
     """Send our banner and read the listener's reply (see ``protocol``).
 
-    ``COLS`` / ``ROWS`` -> that terminal size, defaults for what's missing.
+    ``COLS`` / ``ROWS`` -> a ``Terminal`` of that size, defaults for what's
+    missing; ``LINE`` -> in line mode.
     ``CONTINUE`` -> ``None``: no shell for us — and with ``COOLDOWN``
     seconds this thread doesn't dial again for that long.
     The listener hanging up -> ``None`` too. A plain socat/nc listener never
@@ -129,10 +140,12 @@ def handshake(sock):
             with contextlib.suppress(TypeError, ValueError):
                 cool_down(float(reply[Field.COOLDOWN]))
         return None
+    line = reply.get(Field.LINE) is True
     try:
-        return int(reply.get(Field.COLS, DEFAULT_COLS)), int(reply.get(Field.ROWS, DEFAULT_ROWS))
+        return Terminal(int(reply.get(Field.COLS, DEFAULT_COLS)),
+                        int(reply.get(Field.ROWS, DEFAULT_ROWS)), line)
     except (TypeError, ValueError):
-        return DEFAULT_COLS, DEFAULT_ROWS
+        return Terminal(DEFAULT_COLS, DEFAULT_ROWS, line)
 
 
 def attach(frame, host=None, port=None):
@@ -146,8 +159,9 @@ def attach(frame, host=None, port=None):
     if dialed is None:
         return
     sock, release = dialed
-    size = handshake(sock)
-    if size is None:
+    terminal = handshake(sock)
+    if terminal is None:
         release()
         return
-    pty_bridge.run(frame, sock, release, *size)
+    pty_bridge.run(frame, sock, release, terminal.cols, terminal.rows,
+                   protocol.LINE_PROMPT if terminal.line else None)

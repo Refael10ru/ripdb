@@ -144,14 +144,23 @@ remove them).
   both ends build and read messages through it, never through bare strings.
 - `keep_alive(sock)` / `hang_up(sock)` — the socket habits both ends share:
   TCP keepalive, and `shutdown` before `close`.
+- `Identity` — who a target is, from its banner (`host`, `pid`, `thread`).
+- `LINE_PROMPT` — line mode's prompt: `ipdb> ` between the OSC 133 marks
+  `PROMPT_START` and `PROMPT_END`.
 
 ```
-target   -> {"reverse_ipdb": "pty", "host": .., "pid": .., "thread": ..}
+target   -> {"reverse_ipdb": "pty", "host": .., "pid": .., "thread": .., "line": true}
 listener -> {"cols": .., "rows": ..}                attach (80x24 for what's missing)
+listener -> {"cols": .., "rows": .., "line": true}  attach in line mode (agents)
 listener -> {"continue": true, "cooldown": ..}      no shell; stay away that long
 ```
 
-After the reply the socket is a raw vt100 terminal until it closes.
+After the reply the socket is a raw vt100 terminal until it closes. In line
+mode it carries plain lines instead: the client passes `LINE_PROMPT` down to
+the debugger (`pty_bridge.run(..., line_prompt)` → `ReverseIPdb`), which
+then reads each command as one line from a canonical, non-echoing pty and
+writes no colour. Everything else in the session (detach, Ctrl-C, hang-up,
+release) is the same code.
 
 ## The peer — Listener (`serve.py`)
 
@@ -178,6 +187,17 @@ released (hung up, so it runs on) when its session ends and when the listener
 exits. One bad session is caught and never brings the listener down. It
 depends on none of the layers above; `protocol.py` is the only code it shares
 with them.
+
+## The peer for a program — `agent.py`, `mcp_server.py`
+
+`agent.AgentListener` is the listener an AI agent uses instead of
+`serve`: it attaches every target in line mode, all at once (no queue), and
+gives each a `Session` whose `send` / `wait` / `interrupt` / `detach` return
+a `Reply`: the output since the last prompt (cleaned of escape sequences) and
+a `Status`. A target that can't do line mode is told to `continue`.
+`mcp_server` exposes it as MCP tools for the agent's client; it is the only
+module that needs the optional `mcp` dependency. Like `serve`, both share
+only `protocol` with the target side. See [agents.md](agents.md).
 
 ## Why these boundaries
 

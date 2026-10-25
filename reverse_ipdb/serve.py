@@ -40,41 +40,14 @@ import termios
 import threading
 import time
 import tty
-from typing import NamedTuple
 
 from reverse_ipdb import protocol
-from reverse_ipdb.protocol import Field
+from reverse_ipdb.protocol import Field, Identity
 
 
 def _note(msg):
     """Print a roster line to stderr, flushed so it shows up live."""
     print(f"*** {msg}", file=sys.stderr, flush=True)
-
-
-class Identity(NamedTuple):
-    """Who a container is, from its banner: shown as ``<host> pid=.. thread=..``
-    with whichever parts it sent."""
-
-    host: object = None
-    pid: object = None
-    thread: object = None
-
-    @classmethod
-    def from_banner(cls, msg):
-        """Whatever JSON the banner carries, as strings (hashable: the digest
-        counts by identity)."""
-        return cls(*(None if msg.get(key) is None else str(msg[key])
-                     for key in (Field.HOST, Field.PID, Field.THREAD)))
-
-    @property
-    def process(self):
-        return self._replace(thread=None)
-
-    def __str__(self):
-        parts = [] if self.host is None else [str(self.host)]
-        parts += [f"{key.value}={value}" for key, value in
-                  ((Field.PID, self.pid), (Field.THREAD, self.thread)) if value is not None]
-        return " ".join(parts)
 
 
 def _read_banner(conn):

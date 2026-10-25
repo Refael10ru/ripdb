@@ -34,6 +34,7 @@ def test_banner_is_a_pty_tagged_identity():
     msg = json.loads(line)
     assert msg["reverse_ipdb"] == "pty"
     assert msg["pid"] == os.getpid() and msg["thread"] == "MainThread" and msg["host"]
+    assert msg["line"] is True                      # it can do line mode (agents)
 
 
 def test_dial_no_listener_returns_none_and_releases_lock():

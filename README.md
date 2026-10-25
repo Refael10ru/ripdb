@@ -191,6 +191,24 @@ session meanwhile.
 This is deliberate: a stray `q` over a flaky debugging link should never raise
 `BdbQuit` into production code.
 
+## AI agents
+
+An AI coding agent can take the breakpoint instead of you: `reverse_ipdb-mcp`
+is an [MCP](https://modelcontextprotocol.io) server that listens where
+`reverse_ipdb-serve` would and gives the agent tools to wait for a breakpoint,
+run ipdb commands, step, interrupt and detach. Targets need no change. For
+Claude Code:
+
+```sh
+claude mcp add reverse-ipdb -- \
+  uvx --from "reverse_ipdb[mcp] @ git+https://github.com/Refael10ru/reverse_ipdb" reverse_ipdb-mcp
+```
+
+Setup for other agents, the tools, how it works (a plain-text **line mode**
+with OSC 133 prompt marks instead of the full-screen terminal) and its limits:
+[docs/agents.md](docs/agents.md). A Claude Code skill with the workflow is in
+[skills/reverse-ipdb](skills/reverse-ipdb/SKILL.md).
+
 ## Design notes
 
 - **Fail-open.** Can't connect within ~1s → `set_trace()` returns and the program
@@ -240,11 +258,14 @@ reverse_ipdb/
   __init__.py    public API re-exports (set_trace, set_trace_ipython, docker_set_trace)
   api.py         the entry points
   client.py      target side: resolve host/port, dial out, handshake, single-shell lock, cooldown
-  debugger.py    ReverseIPdb (IPython TerminalPdb) + detach-on-quit mixin
+  debugger.py    ReverseIPdb (IPython TerminalPdb): detach on quit, Ctrl-C, line mode
   pty_bridge.py  IPython-over-pty launcher so prompt_toolkit completion works
   protocol.py    the handshake wire format, shared by target and listener
   serve.py       the listener: python -m reverse_ipdb.serve
+  agent.py       the listener for a program: every target in line mode, one Session each
+  mcp_server.py  agent.py as MCP tools: reverse_ipdb-mcp (needs the mcp extra)
 examples/        runnable scripts for trying it locally (see examples/README.md)
+skills/          a Claude Code skill for debugging with reverse_ipdb-mcp
 tests/           pytest suite (unit + end-to-end over a real socket)
 ```
 

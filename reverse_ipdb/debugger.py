@@ -16,6 +16,10 @@ debugged program:
 - **A listener hang-up** (``hang_up``) ends the prompt; no new stop begins.
 - **Afterwards it lets go** of the program's frames and of its own resources
   (``_release``), so nothing outlives the session.
+
+With a ``line_prompt`` it runs in **line mode**, for a program at the other
+end rather than a person: no prompt_toolkit and no colour, each prompt is
+``line_prompt`` written as is, and each command one line read from the pty.
 """
 
 import asyncio
@@ -25,6 +29,8 @@ import ctypes
 import dataclasses
 import enum
 import functools
+import os
+import select
 import signal
 import sys
 import threading
@@ -35,6 +41,7 @@ from IPython.terminal.debugger import TerminalPdb
 
 EOF_COMMAND = "EOF"       # the line pdb's cmdloop turns into do_EOF
 PENDING_NOTE_DELAY = 1.0  # an interrupt not landed by then is stuck behind a C call
+LINE_POLL = 0.1           # line mode: how often a waiting prompt checks for a hang-up
 
 
 class State(enum.Enum):
@@ -52,6 +59,7 @@ class _Session:
     the pump threads read: detached, dispatching, loop, state."""
 
     bridge: object                 # the pty_bridge.Bridge; None once released
+    line_prompt: object = None     # line mode's prompt; None: prompt_toolkit
     thread: int = dataclasses.field(default_factory=threading.get_ident)  # debugged thread
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
     state: State = State.RUNNING
@@ -129,13 +137,18 @@ class _PromptThread:
 class ReverseIPdb(TerminalPdb):
     """IPython's debugger over the pty of ``bridge``, detaching on quit."""
 
-    def __init__(self, bridge=None, **kwargs):
+    def __init__(self, bridge=None, line_prompt=None, **kwargs):
         super().__init__(**kwargs)
         # TerminalPdb's thread pool hasn't started a thread yet (it does on the
         # first submit); retire it and prompt on our own threads instead.
         self.thread_executor.shutdown(wait=False)
         self.thread_executor = _PromptThread()
-        self._rv = _Session(bridge)
+        self._rv = _Session(bridge, line_prompt)
+        if line_prompt is not None:
+            try:
+                self.set_theme_name("nocolor")  # IPython 9
+            except AttributeError:
+                self.set_colors("NoColor")      # IPython 8
 
     # --- leaving ------------------------------------------------------------
 
@@ -182,6 +195,21 @@ class ReverseIPdb(TerminalPdb):
                 bp.deleteMe()
         self.breaks = {}
 
+    def do_interact(self, arg):
+        if self._rv.line_prompt is not None:  # it would start a prompt_toolkit shell
+            self.error("interact needs a terminal: in line mode, run statements with !")
+            return None
+        return super().do_interact(arg)
+
+    def do_debug(self, arg):
+        if self._rv.line_prompt is not None:  # the nested debugger would prompt_toolkit
+            self.error("debug needs a terminal: in line mode, set a breakpoint and step")
+            return None
+        return super().do_debug(arg)
+
+    do_interact.__doc__ = TerminalPdb.do_interact.__doc__  # `help interact` as before
+    do_debug.__doc__ = TerminalPdb.do_debug.__doc__
+
     # --- a stop ---------------------------------------------------------------
 
     default = _evaluates_code(TerminalPdb.default)
@@ -225,6 +253,8 @@ class ReverseIPdb(TerminalPdb):
         fires once the prompt's future exists, so ``hang_up`` either sees its
         loop or the hook sees ``detached`` — never neither.
         """
+        if self._rv.line_prompt is not None:
+            return self._read_line()
         app = self.pt_app.app
         self._rv.state = State.PROMPT
 
@@ -248,6 +278,26 @@ class ReverseIPdb(TerminalPdb):
             with self._rv.lock:
                 self._rv.loop = None
 
+    def _read_line(self):
+        """Line mode's prompt: write the prompt, read one line. Polls, so a
+        hang-up (``detached``) ends it as end-of-file within ``LINE_POLL``."""
+        self._rv.state = State.PROMPT
+        try:
+            self.stdout.write(self._rv.line_prompt)
+            self.stdout.flush()
+            fd = self.stdin.fileno()
+            while not self._rv.detached:
+                if select.select([fd], [], [], LINE_POLL)[0]:
+                    line = os.read(fd, 65536)  # canonical mode: one whole line
+                    if not line:
+                        break
+                    return line.decode("utf-8", "replace").rstrip("\r\n")
+            return EOF_COMMAND
+        except (OSError, ValueError):  # the pty is gone
+            return EOF_COMMAND
+        finally:
+            self._rv.state = State.STOPPED
+
     # --- called by the bridge's pump threads ------------------------------------
 
     def interrupt(self):
@@ -268,7 +318,9 @@ class ReverseIPdb(TerminalPdb):
                 self.message("\nProgram interrupted: stopping at the next line it runs.")
                 self.set_step()
             return True
-        return False
+        # At the prompt: prompt_toolkit clears the line; a line-mode reader
+        # has no line to clear, so the byte is dropped.
+        return self._rv.line_prompt is not None
 
     def _note_if_pending(self, command):
         """The interrupt went in as an async exception and its command is still

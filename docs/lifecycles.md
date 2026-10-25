@@ -95,3 +95,9 @@ traced memory.
 - **Listener: the `continued` counter.** It grows with the distinct
   thread identities turned away during one attached session, and is cleared at
   every detach.
+- **Agent listener: ended sessions.** `AgentListener` keeps up to 32 ended
+  sessions after the open ones, so an agent asking about one hears "ended"
+  rather than "no such session"; older ones are forgotten. Its `refused` list
+  keeps the last 20 targets it turned away. Each open session holds a socket
+  and a reader thread until its target hangs up, it is detached, or the
+  listener closes.

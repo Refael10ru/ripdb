@@ -16,7 +16,8 @@ LIB = pathlib.Path(__file__).resolve().parent.parent / "reverse_ipdb"
 RESOURCE_CALLS = {
     # file descriptors
     "open", "os.open", "os.openpty", "os.pipe", "os.dup", "os.dup2", "os.fdopen",
-    "socket.socket", "socket.socketpair", "socket.create_connection", "*.accept",
+    "socket.socket", "socket.socketpair", "socket.create_connection",
+    "socket.create_server", "*.accept",
     "selectors.DefaultSelector", "select.epoll", "select.poll", "mmap.mmap",
     "tempfile.TemporaryFile", "tempfile.NamedTemporaryFile", "tempfile.mkstemp",
     # threads, processes, loops
@@ -68,6 +69,17 @@ LIFECYCLES = {
         "handshake thread: ends after one banner (bounded by BANNER_TIMEOUT)",
     ("serve", "run", "threading.Thread"):
         "acceptor: ends when listener.shutdown() fails accept(); joined on exit",
+    # --- the agent's listener (reverse_ipdb-mcp) ---------------------------------
+    ("agent", "__init__", "socket.create_server"):
+        "the listening socket: AgentListener.close() (shutdown wakes accept, then close)",
+    ("agent", "__init__", "threading.Thread"):
+        "AgentListener's acceptor: ends when close() fails accept(). Each Session's "
+        "reader: ends when its target hangs up or the socket is hung up (detach, close)",
+    ("agent", "_accept", "*.accept"):
+        "each connection: a Session's socket (hung up by its reader on EOF, by "
+        "detach, or by AgentListener.close), or hung up by the handshake (refused)",
+    ("agent", "_accept", "threading.Thread"):
+        "handshake thread: ends after one banner (bounded by BANNER_TIMEOUT)",
 }
 
 # Module- and class-level names that hold state, and why each is bounded.

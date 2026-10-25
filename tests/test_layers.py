@@ -19,6 +19,8 @@ ALLOWED = {
     "debugger": set(),
     "protocol": set(),
     "serve": {"protocol"},                 # the peer: only the wire is shared
+    "agent": {"protocol"},                 # the peer for a program: the wire too
+    "mcp_server": {"agent"},               # MCP tools over the agent's listener
 }
 
 

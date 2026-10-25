@@ -61,6 +61,15 @@ def _set_winsize(fd, cols, rows):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
+def _line_discipline(fd):
+    """Line mode's pty: the kernel collects whole lines (canonical mode), with
+    no echo — the reader knows what it sent — and no signal keys."""
+    with contextlib.suppress(termios.error):
+        attrs = termios.tcgetattr(fd)
+        attrs[3] = (attrs[3] | termios.ICANON) & ~(termios.ECHO | termios.ISIG)
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
 def _abort(sock, release, reason):
     """Fail open after dialing: say why on stderr and on the listener, then
     hang up so the program runs on and later breakpoints still work.
@@ -73,12 +82,13 @@ def _abort(sock, release, reason):
     release()
 
 
-def run(frame, sock, release, cols, rows):
+def run(frame, sock, release, cols, rows, line_prompt=None):
     """Drop ``frame`` into IPython's debugger over a pty, on a live ``sock``.
 
     Layer 2 (``client.attach``) already dialed and handshook; ``release``
     closes the socket and frees the shell lock, and is called exactly when the
-    session ends, however it ends. A debugger that fails to import is reported
+    session ends, however it ends. With a ``line_prompt``, the debugger runs in
+    line mode (see ``debugger``). A debugger that fails to import is reported
     on stderr and to the listener, then the program runs on; nothing here ever
     raises into the debugged program.
     """
@@ -101,9 +111,9 @@ def run(frame, sock, release, cols, rows):
         _abort(sock, release, "debugger import failed, continuing without a shell")
         return
 
-    bridge = Bridge(sock, release, cols, rows)
+    bridge = Bridge(sock, release, cols, rows, line=line_prompt is not None)
     dbg = bridge.dbg = ReverseIPdb(
-        bridge,
+        bridge, line_prompt,
         stdin=bridge.slave_in, stdout=bridge.slave_out,
         nosigint=True, readrc=False,
         pt_session_options={"input": Vt100Input(bridge.slave_in),
@@ -128,13 +138,15 @@ class Bridge:
     Torn down by ``close``, from whichever side ends first.
     """
 
-    def __init__(self, sock, release, cols, rows):
+    def __init__(self, sock, release, cols, rows, line=False):
         self.sock = sock
         self.release = release  # hangs up the socket and frees the shell lock
         self.dbg = None         # set by run, before start
         self.thread = threading.get_ident()  # the debugged thread
         self.master, slave = os.openpty()
         _set_winsize(slave, cols, rows)
+        if line:
+            _line_discipline(slave)
         self.slave_in = os.fdopen(slave, "r", buffering=1, encoding="utf-8",
                                   errors="replace")
         self.slave_out = os.fdopen(os.dup(slave), "w", buffering=1, encoding="utf-8",

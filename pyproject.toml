@@ -20,11 +20,15 @@ classifiers = [
 ]
 dependencies = ["ipython"]
 
+[project.optional-dependencies]
+mcp = ["mcp>=2.3"]  # reverse_ipdb-mcp: the debugger as tools for an AI agent
+
 [project.scripts]
 reverse_ipdb-serve = "reverse_ipdb.serve:main"
+reverse_ipdb-mcp = "reverse_ipdb.mcp_server:main"
 
 [dependency-groups]
-dev = ["pytest", "ruff", "mypy"]
+dev = ["pytest", "ruff", "mypy", "mcp>=2.3"]
 
 [tool.setuptools.packages.find]
 include = ["reverse_ipdb*"]
