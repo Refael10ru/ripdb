@@ -301,12 +301,22 @@ native check for it, so `tests/test_style.py` enforces it by AST-scanning
 - `tests/test_lifecycle_static.py` — every resource-creating call has a
   documented release (`LIFECYCLES`), every thread is a daemon, and every
   module-level state is accounted for (`MODULE_STATE`).
-- `tests/test_agent.py` — line mode against real targets: one command, one
-  plain-text reply (no escapes, prompt or echo; `ipdb> ` in the output kept),
-  stepping, breakpoints, "running" then Ctrl-C, several targets open at
-  once, an old target told to continue and listed as refused, the agent's
-  listener closing releasing everyone; and the MCP tools, in memory and over
-  real stdio.
+- `tests/test_agent.py` — line mode against real targets through
+  `AgentListener`: one command, one plain-text reply (no escapes, prompt or
+  echo; `ipdb> ` in the output kept), stepping, breakpoints, "running" then
+  Ctrl-C, several targets open at once, an old target told to continue and
+  listed as refused, the listener closing releasing everyone.
+- `tests/test_mcp.py` — **the MCP API**, through a real MCP client against
+  real targets: the six tools' names, parameters and defaults and the
+  instructions (the contract an agent codes against); a whole session
+  (reply header `[id · identity · status]`, `;;`, `n`, `debug` refused,
+  detach, an ended session still answering); `running` → `wait_for_prompt`
+  to the next breakpoint, `interrupt` of a busy loop; several programs each
+  handed out once, a refused old target in `list_sessions`, closing the
+  server releasing all; errors that reach the agent as messages (unknown
+  session on every session tool, port in use, a target killed, output cut,
+  timeouts clamped); and over stdio: every stdout line JSON-RPC, tool
+  descriptions unindented. The shared target is in `tests/conftest.py`.
 - `tests/test_api.py` — hand-off to `client.attach` and aliasing.
 - `tests/test_layers.py` — the import graph matches `docs/api-layers.md`.
 - `tests/test_client.py` — fail-open, shell-lock acquire/release via `dial()`,

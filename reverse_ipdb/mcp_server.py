@@ -11,9 +11,11 @@ Nothing is written to stdout here: it carries the MCP protocol.
 """
 
 import argparse
+import inspect
 import sys
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from reverse_ipdb.agent import AgentListener, Status
 
@@ -74,21 +76,24 @@ def build_server(host="0.0.0.0", port=4444):
     server = MCPServer("reverse_ipdb", instructions=INSTRUCTIONS)
     holder = []
 
+    def tool(fn):  # the docstring, without its source indentation, is what the agent reads
+        return server.tool(description=inspect.cleandoc(fn.__doc__))(fn)
+
     def listener():
         if not holder:
             try:
                 holder.append(AgentListener(host, port))
-            except OSError as exc:
-                raise RuntimeError(f"cannot listen on {host}:{port}: {exc}") from exc
+            except OSError as exc:  # ToolError: the message reaches the agent
+                raise ToolError(f"cannot listen on {host}:{port}: {exc}") from exc
         return holder[0]
 
     def session(session_id):
         found = listener().session(session_id)
         if found is None:
-            raise ValueError(f"no session {session_id!r}: see list_sessions")
+            raise ToolError(f"no session {session_id!r}: see list_sessions")
         return found
 
-    @server.tool()
+    @tool
     def wait_for_session(timeout_seconds: float = 60.0) -> str:
         """Wait for a program to reach a breakpoint (reverse_ipdb.set_trace()).
         Returns its session id and where it stopped. Each session is returned
@@ -99,7 +104,7 @@ def build_server(host="0.0.0.0", port=4444):
                     f"(listening on {host}:{port}; targets dial DEBUG_HOST:DEBUG_PORT)")
         return _describe(found, found.wait(0))
 
-    @server.tool()
+    @tool
     def list_sessions() -> str:
         """The open debugging sessions, and targets that could not attach."""
         lst = listener()
@@ -108,7 +113,7 @@ def build_server(host="0.0.0.0", port=4444):
         lines += [f"refused: {who} — {why}" for who, why in list(lst.refused)]
         return "\n".join(lines)
 
-    @server.tool()
+    @tool
     def send_command(session_id: str, command: str, timeout_seconds: float = 30.0) -> str:
         """Run one ipdb command line (p x, ll, w, n, s, c, b f:12, !x = 1, ...)
         in a session at its prompt; returns the output it printed."""
@@ -117,21 +122,21 @@ def build_server(host="0.0.0.0", port=4444):
             return _describe(found, found.wait(0)) + "\n(no command sent)"
         return _describe(found, found.send(command, _clamp(timeout_seconds)), timeout_seconds)
 
-    @server.tool()
+    @tool
     def wait_for_prompt(session_id: str, timeout_seconds: float = 30.0) -> str:
         """Wait for a running session (after n, s, c, ...) to stop again;
         returns the output since the last call."""
         found = session(session_id)
         return _describe(found, found.wait(_clamp(timeout_seconds)), timeout_seconds)
 
-    @server.tool()
+    @tool
     def interrupt(session_id: str) -> str:
         """Ctrl-C: stop a running program at the next line it runs, or
         interrupt a command that is still evaluating code."""
         found = session(session_id)
         return _describe(found, found.interrupt())
 
-    @server.tool()
+    @tool
     def detach(session_id: str) -> str:
         """End the session: its breakpoints are removed and the program runs on.
         Always detach when done."""
