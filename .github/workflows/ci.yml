@@ -23,8 +23,8 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check .
 
-      - name: Type-check (mypy)
-        run: uv run mypy
+      - name: Type-check (mypy --strict)
+        run: uv run mypy --strict  # strict is also pinned in pyproject; the flag makes it visible here
 
       - name: Test (pytest)
         run: uv run pytest -q
