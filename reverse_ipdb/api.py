@@ -12,11 +12,13 @@ POSIX only: the pty machinery (and so this package) imports ``termios``, so
 
 import os
 import sys
+from types import FrameType
 
 from reverse_ipdb import client
 
 
-def set_trace(*, host=None, port=None, frame=None):
+def set_trace(*, host: str | None = None, port: int | None = None,
+              frame: FrameType | None = None) -> None:
     """Pause here and hand an IPython shell (with completion) to the listener.
 
     IPython runs over a pseudo-terminal, so completion/history/colour work. No
@@ -36,7 +38,7 @@ def set_trace(*, host=None, port=None, frame=None):
     client.attach(frame or sys._getframe(1), host=host, port=port)
 
 
-def docker_set_trace(*, host=None, port=None):
+def docker_set_trace(*, host: str | None = None, port: int | None = None) -> None:
     """``set_trace()`` preconfigured for containers.
 
     Identical to :func:`set_trace` except the host default is the Docker
