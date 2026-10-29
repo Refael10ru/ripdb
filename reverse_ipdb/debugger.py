@@ -15,6 +15,10 @@ and never raises into the program's own code:
 - while a command evaluates code (``!expr``, a bare statement, ``p``, ``pp``):
   ``KeyboardInterrupt`` in that command, and back to the prompt;
 - while the program runs (after ``n``, ``s``, ``c``...): stop at the next line.
+
+``interact`` opens a full IPython shell on the current frame over the same
+connection (``_FrameShell``): prompts and output go through the pty instead of
+the process's own stdio, which in a container isn't a terminal at all.
 """
 
 import asyncio
@@ -26,12 +30,16 @@ import signal
 import sys
 import threading
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from types import FrameType, TracebackType
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TextIO, TypeVar, cast
 
 from IPython.terminal.debugger import TerminalPdb
+from IPython.terminal.embed import InteractiveShellEmbed
+from prompt_toolkit.application import Application
+from prompt_toolkit.application.current import create_app_session
+from traitlets.config import Config
 
 if TYPE_CHECKING:
     _Base = TerminalPdb  # the mixin's methods are written against TerminalPdb
@@ -80,13 +88,41 @@ def _evaluates_code(
     """
     @functools.wraps(method)
     def wrapper(self: "ReverseIPdb", arg: str) -> _T:
-        self._reverse_ipdb_command += 1
-        self._reverse_ipdb_state = IN_CODE
-        try:
+        with self._evaluating():
             return method(self, arg)
-        finally:
-            self._reverse_ipdb_state = IN_DEBUGGER
     return wrapper
+
+
+class _FrameShell(InteractiveShellEmbed):
+    """The IPython shell behind ``interact``, driven over the debugger's pty.
+
+    An embedded IPython would otherwise prompt on the process's own stdin and
+    stdout — not the listener, and in a container not even a terminal. So its
+    prompt_toolkit application is bound to the debugger's pty input/output,
+    its prompts run on the debugger's prompt thread (as TerminalPdb's do, so
+    an event loop running in the debugged thread can't clash with
+    prompt_toolkit) and its cells run in the debugging thread like any other
+    command, interruptible by Ctrl-C the same way.
+    """
+
+    def __init__(self, debugger: "ReverseIPdb", **kw: Any) -> None:
+        self._reverse_ipdb = debugger
+        pt_app = debugger.pt_app
+        # __init__ builds the prompt session; an application takes the input
+        # and output of the app session current at construction, for good.
+        with create_app_session(input=pt_app.input, output=pt_app.output):
+            super().__init__(**kw)  # type: ignore[no-untyped-call]
+
+    def prompt_for_code(self) -> str:
+        debugger = self._reverse_ipdb
+        prompt = super().prompt_for_code
+        assert self.pt_app is not None  # simple_prompt is off: the session exists
+        future = debugger.thread_executor.submit(debugger._guarded_prompt, self.pt_app.app, prompt)
+        return future.result()
+
+    def run_cell(self, *args: Any, **kw: Any) -> Any:
+        with self._reverse_ipdb._evaluating():
+            return super().run_cell(*args, **kw)  # type: ignore[no-untyped-call]
 
 
 class DetachMixin(_Base):
@@ -202,8 +238,9 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         # print ("--Return--", "--Call--") before a stop even begins, so a
         # hang-up then must not count as idle and close the pty under it.
         self._reverse_ipdb_dispatching = False
-        # The running prompt's event loop, if any.
-        self._reverse_ipdb_loop: asyncio.AbstractEventLoop | None = None
+        # The prompt that is up (the debugger's or interact's), as its event
+        # loop and prompt_toolkit application, if any.
+        self._reverse_ipdb_prompt: tuple[asyncio.AbstractEventLoop, Application[Any]] | None = None
         # Ctrl-C bookkeeping. The thread that called set_trace is the one that
         # stops, runs the commands and runs the program.
         self._reverse_ipdb_thread = threading.get_ident()
@@ -223,6 +260,58 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
     @_evaluates_code
     def do_pp(self, arg: str) -> bool | None:
         return super().do_pp(arg)
+
+    @contextlib.contextmanager
+    def _evaluating(self) -> Iterator[None]:
+        """The user's code is running (a code-evaluating command, an interact
+        cell): Ctrl-C may interrupt it, see ``interrupt``."""
+        self._reverse_ipdb_command += 1
+        self._reverse_ipdb_state = IN_CODE
+        try:
+            yield
+        finally:
+            self._reverse_ipdb_state = IN_DEBUGGER
+
+    def do_interact(self, arg: str) -> None:
+        """interact
+        Open a full IPython shell on the current frame — completion, history,
+        magics — over this same connection. Assignments made there land in the
+        frame's locals. Ctrl-D or ``exit`` comes back to the ipdb> prompt.
+        """
+        frame = self.curframe
+        assert frame is not None  # we are at a prompt, so we are stopped somewhere
+        # While the shell runs, the process's stdio is the pty — exactly what
+        # pdb does around the code a command evaluates — so that output,
+        # tracebacks and input() land at the listener, not in the container's
+        # own stdout.
+        saved = sys.stdin, sys.stdout, sys.stderr
+        sys.stdin = cast(TextIO, self.stdin)
+        sys.stdout = sys.stderr = cast(TextIO, self.stdout)
+        try:
+            config = Config(self.shell.config)  # a copy: the entry below is this shell's only
+            # IPython 9's tip-of-the-day banner; IPython 8 has no such trait
+            # and ignores the entry.
+            config.TerminalInteractiveShell.enable_tip = False
+            shell = _FrameShell(
+                self, config=config, simple_prompt=False, confirm_exit=False,
+                exit_msg="*** back to ipdb>",
+                banner1="*** IPython on this frame; Ctrl-D or exit returns to ipdb>",
+            )
+            # pdb caches the stopped frame's locals up to 3.12 (a snapshot that
+            # must be reused, so writes persist); from 3.13 f_locals is a
+            # write-through proxy and pdb no longer caches it.
+            if sys.version_info >= (3, 13):
+                local_ns = frame.f_locals
+            else:
+                local_ns = self.curframe_locals
+            shell(module=sys.modules.get(frame.f_globals.get("__name__", "")),
+                  local_ns=local_ns)
+        except Exception:
+            # A shell that fails to come up or blows up is this session's
+            # problem, shown here; it must never raise into the program.
+            self.message(f"*** interact failed:\n{traceback.format_exc()}")
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = saved
 
     def interaction(self, frame: FrameType | None,
                     tb_or_exc: TracebackType | BaseException | None) -> None:
@@ -296,27 +385,9 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
                          "session meanwhile).")
 
     def _prompt(self) -> str:
-        """Run one prompt, unless the listener has hung up: then end it as if
-        Ctrl-D had been pressed, which the debugger takes as ``detach``.
-
-        Runs in TerminalPdb's prompt thread. The pre-run hook fires once the
-        prompt's future exists, so ``hang_up`` either sees its loop or the
-        hook sees the flag — never neither.
-        """
-        app = self.pt_app.app
-        self._reverse_ipdb_state = AT_PROMPT
-
-        def arm() -> None:
-            with self._reverse_ipdb_lock:
-                if self._reverse_ipdb_hung_up:
-                    app.exit(exception=EOFError)
-                else:
-                    self._reverse_ipdb_loop = asyncio.get_running_loop()
-
-        app.pre_run_callables.append(arm)
+        prompt = super()._prompt
         try:
-            line: str = super()._prompt()  # type: ignore[no-untyped-call]
-            return line
+            return self._guarded_prompt(self.pt_app.app, prompt)
         except EOFError:
             # What cmdloop would make of it — but said here, in the prompt
             # thread: re-raised in the debugged thread, the exception's
@@ -324,10 +395,32 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
             # the debugged frame and its locals, keeping them alive in a
             # cycle until the garbage collector happens to run.
             return "EOF"
+
+    def _guarded_prompt(self, app: Application[Any], prompt: Callable[[], str]) -> str:
+        """Run one prompt — the debugger's own, or the interact shell's —
+        unless the listener has hung up: then end it as if Ctrl-D had been
+        pressed, which either takes as "leave".
+
+        Runs in the prompt thread. The pre-run hook fires once the prompt's
+        future exists, so ``hang_up`` either sees the prompt or the hook sees
+        the flag — never neither.
+        """
+        self._reverse_ipdb_state = AT_PROMPT
+
+        def arm() -> None:
+            with self._reverse_ipdb_lock:
+                if self._reverse_ipdb_hung_up:
+                    app.exit(exception=EOFError)
+                else:
+                    self._reverse_ipdb_prompt = (asyncio.get_running_loop(), app)
+
+        app.pre_run_callables.append(arm)
+        try:
+            return prompt()
         finally:
             self._reverse_ipdb_state = IN_DEBUGGER
             with self._reverse_ipdb_lock:
-                self._reverse_ipdb_loop = None
+                self._reverse_ipdb_prompt = None
 
     def hang_up(self) -> bool:
         """The listener is gone. Called by the bridge from a pump thread.
@@ -339,19 +432,19 @@ class ReverseIPdb(DetachMixin, TerminalPdb):
         inside a stop — in which case nothing will touch the pty again and the
         bridge retires it right away.
         """
-        app = self.pt_app.app
-
-        def end_prompt() -> None:
-            if app.future is not None and not app.future.done():
-                app.exit(exception=EOFError)
-
         with self._reverse_ipdb_lock:
             self._reverse_ipdb_hung_up = True
             self._reverse_ipdb_detached = True
-            loop = self._reverse_ipdb_loop
+            prompt = self._reverse_ipdb_prompt
             idle = (self._reverse_ipdb_state == RUNNING
                     and not self._reverse_ipdb_dispatching)
-        if loop is not None:
+        if prompt is not None:
+            loop, app = prompt
+
+            def end_prompt() -> None:
+                if app.future is not None and not app.future.done():
+                    app.exit(exception=EOFError)
+
             with contextlib.suppress(RuntimeError):  # loop already closed: prompt is over
                 loop.call_soon_threadsafe(end_prompt)
         if idle:
