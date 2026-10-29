@@ -201,7 +201,7 @@ pty so TAB reaches `prompt_toolkit`. See `docs/completion.md`.
 ```sh
 uv sync                 # venv + deps + dev tools (pytest/ruff/mypy)
 uv run ruff check .     # lint   (also auto-run in CI)
-uv run mypy             # types
+uv run mypy --strict    # types (strict is pinned in pyproject too; CI passes the flag as well)
 uv run pytest -q        # tests
 ```
 
